@@ -2,10 +2,8 @@ name: weread_lite_flutter
 description: A lightweight dual-platform (Android & Windows PC Portable) local reader with customizable TTS
 publish_to: 'none'
 version: 1.0.0+1
-
 environment:
   sdk: '>=3.0.0 <4.0.0'
-
 dependencies:
   flutter:
     sdk: flutter
@@ -18,6 +16,6 @@ dependencies:
   audioplayers: ^6.1.0
   path_provider: ^2.1.4
   fast_gbk: ^1.1.0
-
+  fast_gbk: ^1.0.0
 flutter:
   uses-material-design: true

@@ -1,48 +1,87 @@
-name: Build Flutter APK
+name: Build Android APK and Windows Portable
 
 on:
   push:
     branches: [ main, master ]
   pull_request:
     branches: [ main, master ]
-  workflow_dispatch: # 支持在 GitHub 网页上手动点击一键打包
+  workflow_dispatch: # 支持在 GitHub 网页手动一键触发打包
 
 jobs:
-  build:
+  # ==================== 1. 安卓端构建 (Android APK) ====================
+  build-android:
+    name: Build Android APK
     runs-on: ubuntu-latest
 
     steps:
-      # 1. 检出代码
-      - name: Checkout Repository
+      - name: 检出仓库代码
         uses: actions/checkout@v4
 
-      # 2. 设置 JDK 17 环境
-      - name: Set up Java
+      - name: 配置 Java 17
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
 
-      # 3. 设置 Flutter 环境
-      - name: Set up Flutter
+      - name: 配置 Flutter 环境
         uses: subosito/flutter-action@v2
         with:
           flutter-version: '3.22.x'
           channel: 'stable'
           cache: true
 
-      # 4. 获取依赖项
-      - name: Install Dependencies
+      - name: 云端补齐平台工程 (免去手动提交平台子文件夹)
+        run: |
+          flutter create . --platforms=android
+          rm -rf lib
+
+      - name: 安装依赖
         run: flutter pub get
 
-      # 5. 编译 Android Release APK
-      - name: Build Android APK
-        run: flutter build apk --release --split-per-abi
+      - name: 编译 Android APK (显式指向根目录 main.dart)
+        run: flutter build apk --release --split-per-abi -t main.dart
 
-      # 6. 上传构建好的 APK 产物供网页直接下载
-      - name: Upload APK Artifacts
+      - name: 归档上传 APK 安装包
         uses: actions/upload-artifact@v4
         with:
-          name: weread-lite-release-apks
+          name: weread-lite-android-apks
           path: build/app/outputs/flutter-apk/*.apk
+          retention-days: 7
+
+  # ==================== 2. PC 桌面便携版构建 (Windows Portable) ====================
+  build-windows:
+    name: Build Windows PC Portable
+    runs-on: windows-latest
+
+    steps:
+      - name: 检出仓库代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Flutter 环境
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.22.x'
+          channel: 'stable'
+          cache: true
+
+      - name: 云端补齐 Windows 桌面宿主 (免去手动提交 windows 文件夹)
+        run: |
+          flutter create . --platforms=windows
+          if (Test-Path lib) { Remove-Item -Recurse -Force lib }
+
+      - name: 安装依赖
+        run: flutter pub get
+
+      - name: 编译 Windows 桌面端 Release (显式指向根目录 main.dart)
+        run: flutter build windows --release -t main.dart
+
+      - name: 打包为免安装便携版 ZIP (绿色单文件包)
+        run: |
+          Compress-Archive -Path build\windows\x64\runner\Release\* -DestinationPath weread-lite-windows-portable.zip -Force
+
+      - name: 归档上传 Windows 便携版 ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: weread-lite-windows-portable
+          path: weread-lite-windows-portable.zip
           retention-days: 7

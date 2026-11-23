@@ -1,0 +1,22 @@
+name: weread_lite_flutter
+description: A lightweight local reader in Flutter with customizable TTS (Fish.audio, System TTS, OpenAI/Custom API)
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  shared_preferences: ^2.3.2
+  file_picker: ^8.1.2
+  archive: ^3.6.1
+  xml: ^6.5.0
+  http: ^1.2.2
+  flutter_tts: ^4.1.0
+  audioplayers: ^6.1.0
+  path_provider: ^2.1.4
+
+flutter:
+  uses-material-design: true

@@ -30,9 +30,11 @@ jobs:
           channel: 'stable'
           cache: true
 
-      - name: 云端补齐平台工程 (免去手动提交平台子文件夹)
+      - name: 云端补齐平台工程 (显式指定项目名，避开仓库名中划线)
         run: |
-          flutter create . --platforms=android
+          cp pubspec.yaml pubspec.yaml.bak
+          flutter create . --platforms=android --project-name weread_lite_flutter
+          cp pubspec.yaml.bak pubspec.yaml
           rm -rf lib
 
       - name: 安装依赖
@@ -64,9 +66,11 @@ jobs:
           channel: 'stable'
           cache: true
 
-      - name: 云端补齐 Windows 桌面宿主 (免去手动提交 windows 文件夹)
+      - name: 云端补齐 Windows 桌面宿主 (显式指定项目名，避开仓库名中划线)
         run: |
-          flutter create . --platforms=windows
+          Copy-Item pubspec.yaml pubspec.yaml.bak
+          flutter create . --platforms=windows --project-name weread_lite_flutter
+          Copy-Item pubspec.yaml.bak pubspec.yaml -Force
           if (Test-Path lib) { Remove-Item -Recurse -Force lib }
 
       - name: 安装依赖

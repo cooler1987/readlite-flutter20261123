@@ -20,13 +20,17 @@ class TtsService {
   int _currentIndex = 0;
   bool _isPlaying = false;
   bool _isPaused = false;
+  bool _initialized = false;
+  int _requestToken = 0; // 用于丢弃过期的异步网络回调
+
+  // 跨章回调：当整章读完时通知外部切到下一章
+  VoidCallback? onChapterComplete;
 
   bool get isPlaying => _isPlaying;
   bool get isPaused => _isPaused;
   TtsSentence? get currentSentence =>
       (_queue.isNotEmpty && _currentIndex < _queue.length) ? _queue[_currentIndex] : null;
 
-  // 进度回调通知
   final StreamController<TtsSentence> _sentenceController =
       StreamController<TtsSentence>.broadcast();
   Stream<TtsSentence> get onSentenceChange => _sentenceController.stream;
@@ -36,14 +40,17 @@ class TtsService {
   Stream<bool> get onPlayStateChange => _stateController.stream;
 
   Future<void> init() async {
-    // 系统 TTS 完成回调
+    if (_initialized) return;
+    _initialized = true;
+
+    // 系统 TTS 播放完成监听 (防重入)
     _flutterTts.setCompletionHandler(() {
       if (_isPlaying && !_isPaused) {
         _playNext();
       }
     });
 
-    // 网络音频播放完成回调
+    // 网络音频播放完成监听 (防重入)
     _audioPlayer.onPlayerComplete.listen((_) {
       if (_isPlaying && !_isPaused) {
         _playNext();
@@ -53,6 +60,9 @@ class TtsService {
 
   void updateConfig(TtsEngineConfig config) {
     _config = config;
+    _flutterTts.setSpeechRate((config.speed * 0.5).clamp(0.0, 1.0));
+    _flutterTts.setPitch(config.pitch.clamp(0.5, 2.0));
+    _audioPlayer.setPlaybackRate(config.speed.clamp(0.5, 2.5));
   }
 
   /// 从指定偏移量开始朗读整个章节
@@ -90,8 +100,14 @@ class TtsService {
   }
 
   Future<void> _speakCurrent() async {
+    final token = ++_requestToken;
+
     if (_currentIndex >= _queue.length) {
-      await stop();
+      if (onChapterComplete != null) {
+        onChapterComplete!();
+      } else {
+        await stop();
+      }
       return;
     }
 
@@ -101,23 +117,28 @@ class TtsService {
     try {
       if (_config.type == TtsEngineType.system) {
         await _flutterTts.setLanguage("zh-CN");
-        await _flutterTts.setSpeechRate(_config.speed * 0.5);
-        await _flutterTts.setPitch(_config.pitch);
-        await _flutterTts.speak(sentence.text);
+        await _flutterTts.setSpeechRate((_config.speed * 0.5).clamp(0.0, 1.0));
+        await _flutterTts.setPitch(_config.pitch.clamp(0.5, 2.0));
+        if (token == _requestToken && _isPlaying && !_isPaused) {
+          await _flutterTts.speak(sentence.text);
+        }
       } else if (_config.type == TtsEngineType.fishAudio) {
-        await _callFishAudio(sentence.text);
+        await _callFishAudio(sentence.text, token);
       } else if (_config.type == TtsEngineType.customHttp) {
-        await _callCustomHttp(sentence.text);
+        await _callCustomHttp(sentence.text, token);
       }
     } catch (e) {
       debugPrint("TTS 朗读出错: $e");
-      // 容错：出错后 1 秒尝试读下一句
-      Future.delayed(const Duration(seconds: 1), _playNext);
+      Future.delayed(const Duration(milliseconds: 1500), () {
+        if (token == _requestToken && _isPlaying && !_isPaused) {
+          _playNext();
+        }
+      });
     }
   }
 
-  /// 调用 Fish.Audio API
-  Future<void> _callFishAudio(String text) async {
+  /// 调用 Fish.Audio API (带 Token 校验防混音)
+  Future<void> _callFishAudio(String text, int token) async {
     final endpoint = _config.apiEndpoint.isNotEmpty
         ? _config.apiEndpoint
         : 'https://api.fish.audio/v1/tts';
@@ -134,16 +155,26 @@ class TtsService {
       'format': 'mp3',
     });
 
-    final resp = await http.post(Uri.parse(endpoint), headers: headers, body: body);
+    final resp = await http
+        .post(Uri.parse(endpoint), headers: headers, body: body)
+        .timeout(const Duration(seconds: 15));
+
+    if (token != _requestToken || !_isPlaying || _isPaused) return;
+
     if (resp.statusCode == 200) {
+      await _audioPlayer.setPlaybackRate(_config.speed.clamp(0.5, 2.5));
       await _audioPlayer.play(BytesSource(resp.bodyBytes));
     } else {
       throw Exception("Fish.Audio 返回错误: ${resp.statusCode} ${resp.body}");
     }
   }
 
-  /// 调用用户自定义的通用 HTTP/OpenAI 兼容 TTS 接口
-  Future<void> _callCustomHttp(String text) async {
+  /// 调用自定义 HTTP / OpenAI 兼容接口 (安全 JSON 转义防崩溃)
+  Future<void> _callCustomHttp(String text, int token) async {
+    // 对 text 做标准 JSON 内部转义，防止破坏模板结构
+    final jsonEscaped = jsonEncode(text);
+    final safeText = jsonEscaped.substring(1, jsonEscaped.length - 1);
+
     String url = _config.apiEndpoint
         .replaceAll('{text}', Uri.encodeComponent(text))
         .replaceAll('{voice_id}', _config.voiceId)
@@ -155,19 +186,26 @@ class TtsService {
     }
 
     String bodyStr = _config.customBodyTemplate
-        .replaceAll('{text}', text)
+        .replaceAll('{text}', safeText)
         .replaceAll('{voice_id}', _config.voiceId)
         .replaceAll('{api_key}', _config.apiKey);
 
     http.Response resp;
     if (bodyStr.trim().isNotEmpty) {
       headers['Content-Type'] ??= 'application/json';
-      resp = await http.post(Uri.parse(url), headers: headers, body: bodyStr);
+      resp = await http
+          .post(Uri.parse(url), headers: headers, body: bodyStr)
+          .timeout(const Duration(seconds: 15));
     } else {
-      resp = await http.get(Uri.parse(url), headers: headers);
+      resp = await http
+          .get(Uri.parse(url), headers: headers)
+          .timeout(const Duration(seconds: 15));
     }
 
+    if (token != _requestToken || !_isPlaying || _isPaused) return;
+
     if (resp.statusCode == 200) {
+      await _audioPlayer.setPlaybackRate(_config.speed.clamp(0.5, 2.5));
       await _audioPlayer.play(BytesSource(resp.bodyBytes));
     } else {
       throw Exception("自定义 TTS 接口错误: ${resp.statusCode}");
@@ -175,7 +213,7 @@ class TtsService {
   }
 
   void _playNext() {
-    if (!_isPlaying) return;
+    if (!_isPlaying || _isPaused) return;
     _currentIndex++;
     _speakCurrent();
   }
@@ -209,6 +247,7 @@ class TtsService {
   Future<void> stop() async {
     _isPlaying = false;
     _isPaused = false;
+    _requestToken++;
     _stateController.add(false);
     await _stopMedia();
   }

@@ -73,32 +73,43 @@ class Storage {
     );
   }
 
+  static Future<void> removeBookmark(String bookId, String bookmarkId) async {
+    final list = getBookmarks(bookId)..removeWhere((b) => b.id == bookmarkId);
+    await _prefs?.setString(
+      '${_keyBookmarks}_$bookId',
+      jsonEncode(list.map((e) => e.toJson()).toList()),
+    );
+  }
+
   // ---------- TTS 引擎配置 ----------
+
+  static List<TtsEngineConfig> _defaultTtsEngines() => [
+    TtsEngineConfig(
+      id: 'system',
+      name: '系统原生 TTS',
+      type: TtsEngineType.system,
+    ),
+    TtsEngineConfig(
+      id: 'fish_audio',
+      name: 'Fish.Audio 免费/API引擎',
+      type: TtsEngineType.fishAudio,
+      apiEndpoint: 'https://api.fish.audio/v1/tts',
+      apiKey: '',
+      voiceId: '',
+    ),
+  ];
 
   static List<TtsEngineConfig> getTtsEngines() {
     final raw = _prefs?.getString(_keyTtsEngines);
     if (raw == null || raw.isEmpty) {
-      return [
-        TtsEngineConfig(
-          id: 'system',
-          name: '系统原生 TTS',
-          type: TtsEngineType.system,
-        ),
-        TtsEngineConfig(
-          id: 'fish_audio',
-          name: 'Fish.Audio 免费/API引擎',
-          type: TtsEngineType.fishAudio,
-          apiEndpoint: 'https://api.fish.audio/v1/tts',
-          apiKey: '',
-          voiceId: '',
-        ),
-      ];
+      return _defaultTtsEngines();
     }
     try {
       final List list = jsonDecode(raw);
-      return list.map((e) => TtsEngineConfig.fromJson(e)).toList();
+      final res = list.map((e) => TtsEngineConfig.fromJson(e)).toList();
+      return res.isEmpty ? _defaultTtsEngines() : res;
     } catch (_) {
-      return [];
+      return _defaultTtsEngines();
     }
   }
 
@@ -114,9 +125,7 @@ class Storage {
       final found = engines.where((e) => e.id == currentId);
       if (found.isNotEmpty) return found.first;
     }
-    return engines.isNotEmpty
-        ? engines.first
-        : TtsEngineConfig(id: 'system', name: '系统原生 TTS');
+    return engines.isNotEmpty ? engines.first : _defaultTtsEngines().first;
   }
 
   static Future<void> setActiveTtsEngine(String engineId) async {

@@ -15,9 +15,40 @@ import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:xml/xml.dart';
 
+const String kDefaultFishVoiceId = 'cf71d823861b4e0eadff1672d646da36';
+
+void _writeStartupErrorLog(Object error, StackTrace? stack) {
+  try {
+    if (Platform.isWindows) {
+      final exeDir = File(Platform.resolvedExecutable).parent;
+      final logDir = Directory('${exeDir.path}${Platform.pathSeparator}userdata');
+      if (!logDir.existsSync()) {
+        logDir.createSync(recursive: true);
+      }
+      final logFile = File('${logDir.path}${Platform.pathSeparator}startup_error.log');
+      logFile.writeAsStringSync(
+        '[${DateTime.now().toIso8601String()}] $error\n${stack ?? ''}\n\n',
+        mode: FileMode.append,
+      );
+    }
+  } catch (_) {}
+}
+
 void main() {
-  WidgetsFlutterBinding.ensureInitialized();
-  runApp(const WereadLiteApp());
+  runZonedGuarded(() {
+    WidgetsFlutterBinding.ensureInitialized();
+    FlutterError.onError = (details) {
+      FlutterError.presentError(details);
+      _writeStartupErrorLog(details.exception, details.stack);
+    };
+    WidgetsBinding.instance.platformDispatcher.onError = (error, stack) {
+      _writeStartupErrorLog(error, stack);
+      return true;
+    };
+    runApp(const WereadLiteApp());
+  }, (error, stack) {
+    _writeStartupErrorLog(error, stack);
+  });
 }
 
 class WereadLiteApp extends StatelessWidget {
@@ -49,6 +80,8 @@ class TtsEngineConfig {
   final String apiEndpoint;
   final String apiKey;
   final String voiceId;
+  final String model;
+  final String method; // 'GET' | 'POST'
   final double speed;
   final double pitch;
   final Map<String, String> customHeaders;
@@ -61,6 +94,8 @@ class TtsEngineConfig {
     this.apiEndpoint = 'https://api.fish.audio/v1/tts',
     this.apiKey = '',
     this.voiceId = '',
+    this.model = '',
+    this.method = 'POST',
     this.speed = 1.0,
     this.pitch = 1.0,
     this.customHeaders = const {},
@@ -74,27 +109,40 @@ class TtsEngineConfig {
         'apiEndpoint': apiEndpoint,
         'apiKey': apiKey,
         'voiceId': voiceId,
+        'model': model,
+        'method': method,
         'speed': speed,
         'pitch': pitch,
         'customHeaders': customHeaders,
         'customBodyTemplate': customBodyTemplate,
       };
 
-  factory TtsEngineConfig.fromJson(Map<String, dynamic> json) => TtsEngineConfig(
-        id: json['id'] ?? '',
-        name: json['name'] ?? '默认引擎',
-        type: TtsEngineType.values.firstWhere(
-          (e) => e.name == json['type'],
-          orElse: () => TtsEngineType.system,
-        ),
-        apiEndpoint: json['apiEndpoint'] ?? 'https://api.fish.audio/v1/tts',
-        apiKey: json['apiKey'] ?? '',
-        voiceId: json['voiceId'] ?? '',
-        speed: (json['speed'] as num?)?.toDouble() ?? 1.0,
-        pitch: (json['pitch'] as num?)?.toDouble() ?? 1.0,
-        customHeaders: Map<String, String>.from(json['customHeaders'] ?? {}),
-        customBodyTemplate: json['customBodyTemplate'] ?? '',
-      );
+  factory TtsEngineConfig.fromJson(Map<String, dynamic> json) {
+    final type = TtsEngineType.values.firstWhere(
+      (e) => e.name == json['type'],
+      orElse: () => TtsEngineType.system,
+    );
+    final bodyTpl = json['customBodyTemplate'] ?? '';
+    final rawMethod = (json['method'] as String?)?.toUpperCase().trim();
+    final resolvedMethod = (rawMethod == 'GET' || rawMethod == 'POST')
+        ? rawMethod!
+        : (type == TtsEngineType.customHttp && bodyTpl.trim().isEmpty ? 'GET' : 'POST');
+
+    return TtsEngineConfig(
+      id: json['id'] ?? '',
+      name: json['name'] ?? '默认引擎',
+      type: type,
+      apiEndpoint: json['apiEndpoint'] ?? 'https://api.fish.audio/v1/tts',
+      apiKey: json['apiKey'] ?? '',
+      voiceId: json['voiceId'] ?? '',
+      model: json['model'] ?? (type == TtsEngineType.fishAudio ? 's2.1-pro' : ''),
+      method: resolvedMethod,
+      speed: (json['speed'] as num?)?.toDouble() ?? 1.0,
+      pitch: (json['pitch'] as num?)?.toDouble() ?? 1.0,
+      customHeaders: Map<String, String>.from(json['customHeaders'] ?? {}),
+      customBodyTemplate: bodyTpl,
+    );
+  }
 
   TtsEngineConfig copyWith({
     String? name,
@@ -102,6 +150,8 @@ class TtsEngineConfig {
     String? apiEndpoint,
     String? apiKey,
     String? voiceId,
+    String? model,
+    String? method,
     double? speed,
     double? pitch,
     Map<String, String>? customHeaders,
@@ -114,6 +164,8 @@ class TtsEngineConfig {
       apiEndpoint: apiEndpoint ?? this.apiEndpoint,
       apiKey: apiKey ?? this.apiKey,
       voiceId: voiceId ?? this.voiceId,
+      model: model ?? this.model,
+      method: method ?? this.method,
       speed: speed ?? this.speed,
       pitch: pitch ?? this.pitch,
       customHeaders: customHeaders ?? this.customHeaders,
@@ -259,6 +311,7 @@ class Storage {
   static const String _keyBookmarks = 'weread_lite_bookmarks';
   static const String _keyTtsEngines = 'weread_lite_tts_engines';
   static const String _keyCurrentTtsId = 'weread_lite_current_tts_id';
+  static const String _keyNodeLunesInjected = 'weread_lite_node_lunes_injected';
   static const String _keyFontSize = 'weread_lite_font_size';
   static const String _keyLineHeight = 'weread_lite_line_height';
   static const String _keyMargin = 'weread_lite_margin';
@@ -278,24 +331,40 @@ class Storage {
     if (Platform.isWindows) {
       try {
         final exeDir = File(Platform.resolvedExecutable).parent;
-        final dataDir = Directory('${exeDir.path}${Platform.pathSeparator}data');
-        if (!await dataDir.exists()) {
-          await dataDir.create(recursive: true);
+        // 使用独立的 userdata 目录，避免与 Flutter 引擎自带的 data/ 资源目录冲突
+        final userDataDir = Directory('${exeDir.path}${Platform.pathSeparator}userdata');
+        if (!await userDataDir.exists()) {
+          await userDataDir.create(recursive: true);
         }
-        final probeFile = File('${dataDir.path}${Platform.pathSeparator}.write_test');
+        final probeFile = File('${userDataDir.path}${Platform.pathSeparator}.write_test');
         await probeFile.writeAsString('ok');
         await probeFile.delete();
 
-        _portableDataDir = dataDir;
+        _portableDataDir = userDataDir;
         _isPortable = true;
 
-        final settingsFile = File('${dataDir.path}${Platform.pathSeparator}settings.json');
+        final settingsFile = File('${userDataDir.path}${Platform.pathSeparator}settings.json');
         if (await settingsFile.exists()) {
           final raw = await settingsFile.readAsString();
           if (raw.trim().isNotEmpty) {
             final decoded = jsonDecode(raw);
             if (decoded is Map<String, dynamic>) {
               _portableData = decoded;
+            }
+          }
+        } else {
+          // 兼容迁移旧版 data/settings.json
+          final legacyFile = File(
+            '${exeDir.path}${Platform.pathSeparator}data${Platform.pathSeparator}settings.json',
+          );
+          if (await legacyFile.exists()) {
+            final raw = await legacyFile.readAsString();
+            if (raw.trim().isNotEmpty) {
+              final decoded = jsonDecode(raw);
+              if (decoded is Map<String, dynamic>) {
+                _portableData = decoded;
+                await _flushPortable();
+              }
             }
           }
         }
@@ -466,6 +535,18 @@ class Storage {
 
   // ---------- TTS 引擎配置 ----------
 
+  static TtsEngineConfig _defaultNodeLunesEngine() => TtsEngineConfig(
+        id: 'builtin_node_lunes',
+        name: '自建云端容器 (node55)',
+        type: TtsEngineType.customHttp,
+        method: 'GET',
+        apiEndpoint:
+            'http://node55.lunes.host:3001/?text={{text}}&speed={{speed}}&voice={{voice}}&model=s2.1-pro-free',
+        apiKey: '',
+        voiceId: kDefaultFishVoiceId,
+        customBodyTemplate: '',
+      );
+
   static List<TtsEngineConfig> _defaultTtsEngines() => [
         TtsEngineConfig(
           id: 'system',
@@ -478,8 +559,11 @@ class Storage {
           type: TtsEngineType.fishAudio,
           apiEndpoint: 'https://api.fish.audio/v1/tts',
           apiKey: '',
-          voiceId: '',
+          voiceId: kDefaultFishVoiceId,
+          model: 's2.1-pro',
+          method: 'POST',
         ),
+        _defaultNodeLunesEngine(),
       ];
 
   static List<TtsEngineConfig> getTtsEngines() {
@@ -492,7 +576,27 @@ class Storage {
       final res = list
           .map((e) => TtsEngineConfig.fromJson(Map<String, dynamic>.from(e)))
           .toList();
-      return res.isEmpty ? _defaultTtsEngines() : res;
+      if (res.isEmpty) return _defaultTtsEngines();
+
+      bool dirty = false;
+      // 迁移：为旧版未填默认发音人的 Fish.Audio 补充默认 voiceId
+      for (int i = 0; i < res.length; i++) {
+        if (res[i].id == 'fish_audio' && res[i].voiceId.trim().isEmpty) {
+          res[i] = res[i].copyWith(voiceId: kDefaultFishVoiceId);
+          dirty = true;
+        }
+      }
+      // 迁移：首次升级自动注入可编辑的 node55 中转引擎
+      final hasNodeLunes = res.any((e) => e.id == 'builtin_node_lunes');
+      if (!hasNodeLunes && _getBool(_keyNodeLunesInjected) != true) {
+        res.add(_defaultNodeLunesEngine());
+        _setBool(_keyNodeLunesInjected, true);
+        dirty = true;
+      }
+      if (dirty) {
+        saveTtsEngines(res);
+      }
+      return res;
     } catch (_) {
       return _defaultTtsEngines();
     }
@@ -501,6 +605,7 @@ class Storage {
   static Future<void> saveTtsEngines(List<TtsEngineConfig> engines) async {
     final raw = jsonEncode(engines.map((e) => e.toJson()).toList());
     await _setString(_keyTtsEngines, raw);
+    await _setBool(_keyNodeLunesInjected, true);
   }
 
   static TtsEngineConfig getActiveTtsEngine() {
@@ -994,11 +1099,13 @@ class TtsService {
   int _currentIndex = 0;
   bool _isPlaying = false;
   bool _isPaused = false;
+  bool _isTesting = false;
   bool _systemTtsReady = false;
   bool _audioPlayerReady = false;
   int _requestToken = 0;
   int _consecutiveErrors = 0;
   String _lastLang = '';
+  String? _lastPlayerLogError;
 
   VoidCallback? onChapterComplete;
 
@@ -1024,6 +1131,10 @@ class TtsService {
     if (!_systemTtsReady) {
       _systemTtsReady = true;
       tts.setCompletionHandler(() {
+        if (_isTesting) {
+          stop();
+          return;
+        }
         if (_isPlaying && !_isPaused) {
           _consecutiveErrors = 0;
           _playNext();
@@ -1049,10 +1160,27 @@ class TtsService {
     final player = _audioPlayer ??= AudioPlayer();
     if (!_audioPlayerReady) {
       _audioPlayerReady = true;
+      try {
+        player.setReleaseMode(ReleaseMode.stop);
+      } catch (_) {}
       player.onPlayerComplete.listen((_) {
+        if (_isTesting) {
+          stop();
+          return;
+        }
         if (_isPlaying && !_isPaused) {
           _consecutiveErrors = 0;
           _playNext();
+        }
+      });
+      player.onLog.listen((logMsg) {
+        final lower = logMsg.toLowerCase();
+        if (lower.contains('error') || lower.contains('exception') || lower.contains('failed')) {
+          _lastPlayerLogError = logMsg;
+          debugPrint('AudioPlayer log error: $logMsg');
+          if (_isPlaying && !_isPaused && !_isTesting) {
+            _handlePlaybackError('音频播放异常: $logMsg', _requestToken);
+          }
         }
       });
     }
@@ -1091,6 +1219,7 @@ class TtsService {
     }
 
     _consecutiveErrors = 0;
+    _isTesting = false;
     _isPlaying = true;
     _isPaused = false;
     _stateController.add(true);
@@ -1152,23 +1281,111 @@ class TtsService {
     });
   }
 
-  Future<void> _playAudioBytes(Uint8List bytes, double speed, int token) async {
+  String _detectAudioExtension(Uint8List bytes) {
+    if (bytes.length >= 4 &&
+        bytes[0] == 0x52 &&
+        bytes[1] == 0x49 &&
+        bytes[2] == 0x46 &&
+        bytes[3] == 0x46) {
+      return 'wav';
+    }
+    if (bytes.length >= 4 &&
+        bytes[0] == 0x4F &&
+        bytes[1] == 0x67 &&
+        bytes[2] == 0x67 &&
+        bytes[3] == 0x53) {
+      return 'ogg';
+    }
+    return 'mp3';
+  }
+
+  Future<void> _playAudioBytes(
+    Uint8List bytes,
+    double speed,
+    int token, {
+    bool serverAppliedSpeed = false,
+  }) async {
+    if (bytes.isEmpty) {
+      throw Exception('接口返回的音频数据为空');
+    }
     if (token != _requestToken || !_isPlaying || _isPaused) return;
     final player = _ensureAudioPlayer();
+    _lastPlayerLogError = null;
+
     try {
-      await player.play(BytesSource(bytes, mimeType: 'audio/mpeg'));
-    } catch (_) {
+      await player.stop();
+    } catch (_) {}
+    if (token != _requestToken || !_isPlaying || _isPaused) return;
+
+    final ext = _detectAudioExtension(bytes);
+    bool played = false;
+    try {
+      // 优先落盘为临时文件并通过 DeviceFileSource 播放，避免 Android BytesSource 兼容性问题
       final tmpDir = await getTemporaryDirectory();
       final tmpFile = File(
-        '${tmpDir.path}${Platform.pathSeparator}tts_cache_${token % 4}.mp3',
+        '${tmpDir.path}${Platform.pathSeparator}tts_cache_${token % 6}.$ext',
       );
       await tmpFile.writeAsBytes(bytes, flush: true);
       if (token != _requestToken || !_isPlaying || _isPaused) return;
       await player.play(DeviceFileSource(tmpFile.path));
-    }
-    try {
-      await player.setPlaybackRate(speed.clamp(0.5, 2.5));
+      played = true;
     } catch (_) {}
+
+    if (!played) {
+      if (token != _requestToken || !_isPlaying || _isPaused) return;
+      await player.play(
+        BytesSource(
+          bytes,
+          mimeType: ext == 'wav' ? 'audio/wav' : (ext == 'ogg' ? 'audio/ogg' : 'audio/mpeg'),
+        ),
+      );
+    }
+
+    if (!serverAppliedSpeed && (speed - 1.0).abs() >= 0.05) {
+      try {
+        await player.setPlaybackRate(speed.clamp(0.5, 2.5));
+      } catch (_) {}
+    }
+  }
+
+  String _cleanApiKey(String raw) {
+    var s = raw.trim();
+    if (s.toLowerCase().startsWith('bearer ')) {
+      s = s.substring(7).trim();
+    }
+    return s;
+  }
+
+  String _extractHttpErrorBody(http.Response resp) {
+    try {
+      final text = utf8.decode(resp.bodyBytes, allowMalformed: true).trim();
+      if (text.isEmpty) return '';
+      final decoded = jsonDecode(text);
+      if (decoded is Map) {
+        final msg = decoded['message'] ?? decoded['detail'] ?? decoded['error'];
+        if (msg != null) return msg.toString();
+      }
+      return text.length > 160 ? '${text.substring(0, 160)}...' : text;
+    } catch (_) {
+      return '';
+    }
+  }
+
+  void _validateAudioResponse(http.Response resp, String label) {
+    if (resp.statusCode != 200) {
+      final detail = _extractHttpErrorBody(resp);
+      throw Exception(
+        detail.isEmpty ? '$label 错误 HTTP ${resp.statusCode}' : '$label 错误 ${resp.statusCode}: $detail',
+      );
+    }
+    final ct = (resp.headers['content-type'] ?? '').toLowerCase();
+    if (ct.contains('application/json') || ct.startsWith('text/')) {
+      final detail = _extractHttpErrorBody(resp);
+      throw Exception('$label 返回了非音频内容: ${detail.isEmpty ? ct : detail}');
+    }
+    if (resp.bodyBytes.isEmpty) {
+      throw Exception('$label 返回了空音频');
+    }
   }
 
   Future<void> _callFishAudio(String text, int token) async {
@@ -1180,35 +1397,70 @@ class TtsService {
       throw Exception('Fish.Audio 接口地址无效');
     }
 
-    final headers = {
+    final apiKey = _cleanApiKey(_config.apiKey);
+    if (apiKey.isEmpty) {
+      throw Exception('请先填写 Fish.Audio API Key');
+    }
+
+    final voiceId = _config.voiceId.trim();
+    final model = _config.model.trim().isNotEmpty ? _config.model.trim() : 's2.1-pro';
+
+    final headers = <String, String>{
       'Content-Type': 'application/json',
-      if (_config.apiKey.isNotEmpty) 'Authorization': 'Bearer ${_config.apiKey}',
+      'Authorization': 'Bearer $apiKey',
+      'model': model,
       ..._config.customHeaders,
     };
 
     final body = jsonEncode({
       'text': text,
-      if (_config.voiceId.isNotEmpty) 'reference_id': _config.voiceId,
+      if (voiceId.isNotEmpty) 'reference_id': voiceId,
       'format': 'mp3',
+      'prosody': {
+        'speed': double.parse(_config.speed.clamp(0.5, 2.0).toStringAsFixed(2)),
+      },
     });
 
     final resp = await http
         .post(uri, headers: headers, body: body)
-        .timeout(const Duration(seconds: 15));
+        .timeout(const Duration(seconds: 30));
 
     if (token != _requestToken || !_isPlaying || _isPaused) return;
 
-    if (resp.statusCode == 200) {
-      _consecutiveErrors = 0;
-      await _playAudioBytes(resp.bodyBytes, _config.speed, token);
-    } else {
-      throw Exception('Fish.Audio 错误 ${resp.statusCode}');
-    }
+    _validateAudioResponse(resp, 'Fish.Audio');
+    _consecutiveErrors = 0;
+    await _playAudioBytes(resp.bodyBytes, _config.speed, token, serverAppliedSpeed: true);
   }
 
   String _escapeJsonInner(String raw) {
     final encoded = jsonEncode(raw);
     return encoded.substring(1, encoded.length - 1);
+  }
+
+  String _formatSpeed(double speed) {
+    return double.parse(speed.clamp(0.5, 2.5).toStringAsFixed(2)).toString();
+  }
+
+  String _applyTemplate(String template, String text, {required bool urlEncode}) {
+    final speedStr = _formatSpeed(_config.speed);
+    final voiceStr = _config.voiceId.trim();
+    final keyStr = _cleanApiKey(_config.apiKey);
+
+    String encode(String val) => urlEncode ? Uri.encodeComponent(val) : _escapeJsonInner(val);
+
+    return template
+        .replaceAll('{{text}}', encode(text))
+        .replaceAll('{text}', encode(text))
+        .replaceAll('{{speed}}', encode(speedStr))
+        .replaceAll('{speed}', encode(speedStr))
+        .replaceAll('{{voice}}', encode(voiceStr))
+        .replaceAll('{voice}', encode(voiceStr))
+        .replaceAll('{{voice_id}}', encode(voiceStr))
+        .replaceAll('{voice_id}', encode(voiceStr))
+        .replaceAll('{{token}}', encode(keyStr))
+        .replaceAll('{token}', encode(keyStr))
+        .replaceAll('{{api_key}}', encode(keyStr))
+        .replaceAll('{api_key}', encode(keyStr));
   }
 
   Future<void> _callCustomHttp(String text, int token) async {
@@ -1217,44 +1469,55 @@ class TtsService {
       throw Exception('请先配置自定义 HTTP 接口地址');
     }
 
-    final urlStr = rawUrl
-        .replaceAll('{text}', Uri.encodeComponent(text))
-        .replaceAll('{voice_id}', Uri.encodeComponent(_config.voiceId))
-        .replaceAll('{api_key}', Uri.encodeComponent(_config.apiKey));
-
+    final urlStr = _applyTemplate(rawUrl, text, urlEncode: true);
     final uri = Uri.tryParse(urlStr);
     if (uri == null || !uri.hasScheme) {
       throw Exception('自定义接口 URL 格式无效');
     }
 
+    final apiKey = _cleanApiKey(_config.apiKey);
     final headers = Map<String, String>.from(_config.customHeaders);
-    if (_config.apiKey.isNotEmpty && !headers.containsKey('Authorization')) {
-      headers['Authorization'] = 'Bearer ${_config.apiKey}';
+    final hasAuthHeader = headers.keys.any((k) => k.toLowerCase() == 'authorization');
+    if (apiKey.isNotEmpty && !hasAuthHeader) {
+      headers['Authorization'] = 'Bearer $apiKey';
     }
 
-    final bodyStr = _config.customBodyTemplate
-        .replaceAll('{text}', _escapeJsonInner(text))
-        .replaceAll('{voice_id}', _escapeJsonInner(_config.voiceId))
-        .replaceAll('{api_key}', _escapeJsonInner(_config.apiKey));
+    final bodyStr = _applyTemplate(_config.customBodyTemplate, text, urlEncode: false);
+    final usePost = _config.method.toUpperCase() == 'POST' ||
+        (_config.method.toUpperCase() != 'GET' && bodyStr.trim().isNotEmpty);
 
     final http.Response resp;
-    if (bodyStr.trim().isNotEmpty) {
-      headers['Content-Type'] ??= 'application/json';
-      resp = await http
-          .post(uri, headers: headers, body: bodyStr)
-          .timeout(const Duration(seconds: 15));
-    } else {
-      resp = await http.get(uri, headers: headers).timeout(const Duration(seconds: 15));
+    try {
+      if (usePost) {
+        if (!headers.keys.any((k) => k.toLowerCase() == 'content-type')) {
+          headers['Content-Type'] = 'application/json';
+        }
+        resp = await http
+            .post(uri, headers: headers, body: bodyStr)
+            .timeout(const Duration(seconds: 30));
+      } else {
+        resp = await http.get(uri, headers: headers).timeout(const Duration(seconds: 30));
+      }
+    } catch (e) {
+      final msg = e.toString();
+      if (uri.scheme == 'http' && msg.toLowerCase().contains('cleartext')) {
+        throw Exception('Android 拦截了 http 明文请求，请在 AndroidManifest.xml 开启 usesCleartextTraffic');
+      }
+      rethrow;
     }
 
     if (token != _requestToken || !_isPlaying || _isPaused) return;
 
-    if (resp.statusCode == 200) {
-      _consecutiveErrors = 0;
-      await _playAudioBytes(resp.bodyBytes, _config.speed, token);
-    } else {
-      throw Exception('HTTP 错误 ${resp.statusCode}');
-    }
+    _validateAudioResponse(resp, 'HTTP');
+    _consecutiveErrors = 0;
+    final hasSpeedInTemplate =
+        rawUrl.contains('speed') || _config.customBodyTemplate.contains('speed');
+    await _playAudioBytes(
+      resp.bodyBytes,
+      _config.speed,
+      token,
+      serverAppliedSpeed: hasSpeedInTemplate,
+    );
   }
 
   Future<String?> testConfig(TtsEngineConfig config) async {
@@ -1263,9 +1526,13 @@ class TtsService {
     await updateConfig(config);
 
     const sample = '这是一段语音测试，欢迎使用本地听书阅读器。';
+    _queue = [];
+    _currentIndex = 0;
+    _isTesting = true;
     final token = ++_requestToken;
     _isPlaying = true;
     _isPaused = false;
+    _lastPlayerLogError = null;
 
     try {
       if (config.type == TtsEngineType.system) {
@@ -1278,6 +1545,13 @@ class TtsService {
       } else {
         await _callCustomHttp(sample, token);
       }
+
+      await Future.delayed(const Duration(milliseconds: 250));
+      if (_lastPlayerLogError != null) {
+        final err = _lastPlayerLogError!;
+        await stop();
+        return '音频播放器报错: $err';
+      }
       return null;
     } catch (e) {
       await stop();
@@ -1286,7 +1560,7 @@ class TtsService {
   }
 
   void _playNext() {
-    if (!_isPlaying || _isPaused) return;
+    if (!_isPlaying || _isPaused || _isTesting) return;
     _currentIndex++;
     _speakCurrent();
   }
@@ -1330,6 +1604,7 @@ class TtsService {
   Future<void> stop() async {
     _isPlaying = false;
     _isPaused = false;
+    _isTesting = false;
     _requestToken++;
     _stateController.add(false);
     await _stopMedia();
@@ -1348,6 +1623,7 @@ class TtsService {
     }
   }
 }
+
 // ==================== 书架主界面 ====================
 
 class ShelfScreen extends StatefulWidget {
@@ -1506,7 +1782,7 @@ class _ShelfScreenState extends State<ShelfScreen> {
           ),
           IconButton(
             icon: const Icon(Icons.record_voice_over),
-            tooltip: 'TTS 引擎设置 (含 Fish.Audio)',
+            tooltip: 'TTS 引擎设置 (含 Fish.Audio / 中转)',
             onPressed: _showTtsSettingsDialog,
           ),
           IconButton(
@@ -1653,6 +1929,7 @@ class _TtsSettingsDialogState extends State<TtsSettingsDialog> {
   late TextEditingController _nameCtrl;
   late TextEditingController _apiKeyCtrl;
   late TextEditingController _voiceIdCtrl;
+  late TextEditingController _modelCtrl;
   late TextEditingController _endpointCtrl;
   late TextEditingController _bodyTemplateCtrl;
 
@@ -1668,6 +1945,7 @@ class _TtsSettingsDialogState extends State<TtsSettingsDialog> {
     _nameCtrl = TextEditingController(text: _current.name);
     _apiKeyCtrl = TextEditingController(text: _current.apiKey);
     _voiceIdCtrl = TextEditingController(text: _current.voiceId);
+    _modelCtrl = TextEditingController(text: _current.model);
     _endpointCtrl = TextEditingController(text: _current.apiEndpoint);
     _bodyTemplateCtrl = TextEditingController(text: _current.customBodyTemplate);
   }
@@ -1676,6 +1954,7 @@ class _TtsSettingsDialogState extends State<TtsSettingsDialog> {
     _nameCtrl.text = _current.name;
     _apiKeyCtrl.text = _current.apiKey;
     _voiceIdCtrl.text = _current.voiceId;
+    _modelCtrl.text = _current.model;
     _endpointCtrl.text = _current.apiEndpoint;
     _bodyTemplateCtrl.text = _current.customBodyTemplate;
   }
@@ -1685,6 +1964,7 @@ class _TtsSettingsDialogState extends State<TtsSettingsDialog> {
     _nameCtrl.dispose();
     _apiKeyCtrl.dispose();
     _voiceIdCtrl.dispose();
+    _modelCtrl.dispose();
     _endpointCtrl.dispose();
     _bodyTemplateCtrl.dispose();
     super.dispose();
@@ -1695,6 +1975,7 @@ class _TtsSettingsDialogState extends State<TtsSettingsDialog> {
       name: _nameCtrl.text,
       apiKey: _apiKeyCtrl.text,
       voiceId: _voiceIdCtrl.text,
+      model: _modelCtrl.text,
       apiEndpoint: _endpointCtrl.text,
       customBodyTemplate: _bodyTemplateCtrl.text,
     );
@@ -1790,8 +2071,17 @@ class _TtsSettingsDialogState extends State<TtsSettingsDialog> {
                 TextField(
                   controller: _voiceIdCtrl,
                   decoration: const InputDecoration(
-                    labelText: 'Reference ID (声音模型ID)',
-                    hintText: '留空使用官方默认声音，也可输入音色ID',
+                    labelText: 'Reference ID (发音人 ID)',
+                    hintText: kDefaultFishVoiceId,
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: _modelCtrl,
+                  decoration: const InputDecoration(
+                    labelText: 'Model 请求头 (如 s2.1-pro / s2.1-pro-free / s1)',
+                    hintText: 's2.1-pro',
                     border: OutlineInputBorder(),
                   ),
                 ),
@@ -1804,13 +2094,33 @@ class _TtsSettingsDialogState extends State<TtsSettingsDialog> {
                   ),
                 ),
               ] else if (_current.type == TtsEngineType.customHttp) ...[
-                const Text('自定义通用 HTTP / OpenAI TTS',
+                const Text('自定义通用 HTTP / 中转引擎',
                     style: TextStyle(fontWeight: FontWeight.bold)),
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    const Text('请求方式：'),
+                    const SizedBox(width: 8),
+                    DropdownButton<String>(
+                      value: _current.method == 'POST' ? 'POST' : 'GET',
+                      items: const [
+                        DropdownMenuItem(value: 'GET', child: Text('GET')),
+                        DropdownMenuItem(value: 'POST', child: Text('POST')),
+                      ],
+                      onChanged: (m) {
+                        if (m != null) {
+                          setState(() => _current = _current.copyWith(method: m));
+                        }
+                      },
+                    ),
+                  ],
+                ),
                 const SizedBox(height: 8),
                 TextField(
                   controller: _endpointCtrl,
+                  maxLines: 2,
                   decoration: const InputDecoration(
-                    labelText: '接口完整地址 (支持 {text}, {voice_id})',
+                    labelText: '接口地址 (支持 {{text}}, {{speed}}, {{voice}}, {{token}})',
                     border: OutlineInputBorder(),
                   ),
                 ),
@@ -1818,7 +2128,7 @@ class _TtsSettingsDialogState extends State<TtsSettingsDialog> {
                 TextField(
                   controller: _apiKeyCtrl,
                   decoration: const InputDecoration(
-                    labelText: 'API Key / Bearer Token (可选)',
+                    labelText: 'Token / API Key (可选，自动附加 Bearer)',
                     border: OutlineInputBorder(),
                   ),
                 ),
@@ -1826,7 +2136,8 @@ class _TtsSettingsDialogState extends State<TtsSettingsDialog> {
                 TextField(
                   controller: _voiceIdCtrl,
                   decoration: const InputDecoration(
-                    labelText: 'Voice 模型名称 / ID (可选)',
+                    labelText: 'Voice 发音人 ID (替换 {{voice}})',
+                    hintText: kDefaultFishVoiceId,
                     border: OutlineInputBorder(),
                   ),
                 ),
@@ -1835,8 +2146,8 @@ class _TtsSettingsDialogState extends State<TtsSettingsDialog> {
                   controller: _bodyTemplateCtrl,
                   maxLines: 3,
                   decoration: const InputDecoration(
-                    labelText: 'POST JSON 模板 (留空走 GET 请求)',
-                    hintText: '{"model":"tts-1","input":"{text}"}',
+                    labelText: 'POST JSON 模板 (GET 请求留空)',
+                    hintText: '{"model":"tts-1","input":"{{text}}"}',
                     border: OutlineInputBorder(),
                   ),
                 ),
@@ -1883,7 +2194,7 @@ class _TtsSettingsDialogState extends State<TtsSettingsDialog> {
               if (_testMessage != null)
                 Padding(
                   padding: const EdgeInsets.only(top: 8),
-                  child: Text(
+                  child: SelectableText(
                     _testMessage!,
                     style: TextStyle(
                       fontSize: 12,
@@ -1897,9 +2208,10 @@ class _TtsSettingsDialogState extends State<TtsSettingsDialog> {
       ),
       actions: [
         TextButton(
-          onPressed: () {
-            TtsService().stop();
-            Navigator.pop(context);
+          onPressed: () async {
+            await TtsService().stop();
+            await TtsService().updateConfig(Storage.getActiveTtsEngine());
+            if (mounted) Navigator.pop(context);
           },
           child: const Text('取消'),
         ),
@@ -1918,6 +2230,8 @@ class _TtsSettingsDialogState extends State<TtsSettingsDialog> {
               id: 'custom_${DateTime.now().millisecondsSinceEpoch}',
               name: '自定义引擎 $suffix',
               type: TtsEngineType.customHttp,
+              method: 'GET',
+              voiceId: kDefaultFishVoiceId,
             );
             setState(() {
               _engines.add(newEng);

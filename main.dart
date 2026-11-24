@@ -306,7 +306,11 @@ class Storage {
       }
     }
 
-    _prefs = await SharedPreferences.getInstance();
+  try {
+      _prefs = await SharedPreferences.getInstance().timeout(
+        const Duration(seconds: 3),
+      );
+    } catch (_) {}
   }
 
   static Future<Directory> getBooksDir() async {
@@ -993,15 +997,16 @@ class TtsService {
   factory TtsService() => _instance;
   TtsService._internal();
 
-  final FlutterTts _flutterTts = FlutterTts();
-  final AudioPlayer _audioPlayer = AudioPlayer();
+FlutterTts? _flutterTts;
+  AudioPlayer? _audioPlayer;
 
   TtsEngineConfig _config = TtsEngineConfig(id: 'system', name: '系统原生 TTS');
   List<TtsSentence> _queue = [];
   int _currentIndex = 0;
   bool _isPlaying = false;
   bool _isPaused = false;
-  bool _initialized = false;
+  bool _systemTtsReady = false;
+  bool _audioPlayerReady = false;
   int _requestToken = 0;
   int _consecutiveErrors = 0;
   String _lastLang = '';
@@ -1023,43 +1028,56 @@ class TtsService {
   final StreamController<String> _errorController = StreamController<String>.broadcast();
   Stream<String> get onError => _errorController.stream;
 
-  Future<void> init() async {
-    if (_initialized) return;
-    _initialized = true;
+  Future<void> init() async {}
 
-  try {
-      await _flutterTts.awaitSpeakCompletion(false);
-      _flutterTts.setCompletionHandler(() {
+  Future<FlutterTts> _ensureSystemTts() async {
+    final tts = _flutterTts ??= FlutterTts();
+    if (!_systemTtsReady) {
+      _systemTtsReady = true;
+      tts.setCompletionHandler(() {
         if (_isPlaying && !_isPaused) {
           _consecutiveErrors = 0;
           _playNext();
         }
       });
-
-      _flutterTts.setErrorHandler((msg) {
+      tts.setErrorHandler((msg) {
         if (_isPlaying && !_isPaused) {
           _handlePlaybackError('系统语音报错: $msg', _requestToken);
         }
       });
-    } catch (e) {
-      debugPrint('系统 TTS 初始化警告: $e');
+      try {
+        await tts.awaitSpeakCompletion(false);
+      } catch (_) {}
+      try {
+        await tts.setSpeechRate((_config.speed * 0.5).clamp(0.0, 1.0));
+        await tts.setPitch(_config.pitch.clamp(0.5, 2.0));
+      } catch (_) {}
     }
+    return tts;
+  }
 
-
-    _audioPlayer.onPlayerComplete.listen((_) {
-      if (_isPlaying && !_isPaused) {
-        _consecutiveErrors = 0;
-        _playNext();
-      }
-    });
+  AudioPlayer _ensureAudioPlayer() {
+    final player = _audioPlayer ??= AudioPlayer();
+    if (!_audioPlayerReady) {
+      _audioPlayerReady = true;
+      player.onPlayerComplete.listen((_) {
+        if (_isPlaying && !_isPaused) {
+          _consecutiveErrors = 0;
+          _playNext();
+        }
+      });
+    }
+    return player;
   }
 
   Future<void> updateConfig(TtsEngineConfig config) async {
     _config = config;
-    try {
-      await _flutterTts.setSpeechRate((config.speed * 0.5).clamp(0.0, 1.0));
-      await _flutterTts.setPitch(config.pitch.clamp(0.5, 2.0));
-    } catch (_) {}
+    if (_flutterTts != null) {
+      try {
+        await _flutterTts!.setSpeechRate((config.speed * 0.5).clamp(0.0, 1.0));
+        await _flutterTts!.setPitch(config.pitch.clamp(0.5, 2.0));
+      } catch (_) {}
+    }
   }
 
   Future<void> startReading({

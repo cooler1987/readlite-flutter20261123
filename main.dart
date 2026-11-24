@@ -1028,18 +1028,24 @@ class TtsService {
     if (_initialized) return;
     _initialized = true;
 
-    _flutterTts.setCompletionHandler(() {
-      if (_isPlaying && !_isPaused) {
-        _consecutiveErrors = 0;
-        _playNext();
-      }
-    });
+  try {
+      await _flutterTts.awaitSpeakCompletion(false);
+      _flutterTts.setCompletionHandler(() {
+        if (_isPlaying && !_isPaused) {
+          _consecutiveErrors = 0;
+          _playNext();
+        }
+      });
 
-    _flutterTts.setErrorHandler((msg) {
-      if (_isPlaying && !_isPaused) {
-        _handlePlaybackError('系统语音报错: $msg', _requestToken);
-      }
-    });
+      _flutterTts.setErrorHandler((msg) {
+        if (_isPlaying && !_isPaused) {
+          _handlePlaybackError('系统语音报错: $msg', _requestToken);
+        }
+      });
+    } catch (e) {
+      debugPrint('系统 TTS 初始化警告: $e');
+    }
+
 
     _audioPlayer.onPlayerComplete.listen((_) {
       if (_isPlaying && !_isPaused) {
@@ -1141,7 +1147,18 @@ class TtsService {
 
   Future<void> _playAudioBytes(Uint8List bytes, double speed, int token) async {
     if (token != _requestToken || !_isPlaying || _isPaused) return;
-    await _audioPlayer.play(BytesSource(bytes, mimeType: 'audio/mpeg'));
+    try {
+      await _audioPlayer.play(BytesSource(bytes, mimeType: 'audio/mpeg'));
+    } catch (_) {
+      final tmpDir = await getTemporaryDirectory();
+      final tmpFile = File(
+        '${tmpDir.path}${Platform.pathSeparator}tts_cache_${token % 4}.mp3',
+      );
+      await tmpFile.writeAsBytes(bytes, flush: true);
+      if (token != _requestToken || !_isPlaying || _isPaused) return;
+      await _audioPlayer.play(DeviceFileSource(tmpFile.path));
+    }
+
     try {
       await _audioPlayer.setPlaybackRate(speed.clamp(0.5, 2.5));
     } catch (_) {}
@@ -1359,21 +1376,59 @@ class _ShelfScreenState extends State<ShelfScreen> {
     setState(() => _importing = true);
 
     try {
-      final result = await FilePicker.platform.pickFiles(
-        type: FileType.custom,
-        allowedExtensions: ['txt', 'epub'],
+            final result = await FilePicker.platform.pickFiles(
+        type: FileType.any,
+        withReadStream: true,
       );
 
-      if (result != null && result.files.single.path != null) {
-        final srcPath = result.files.single.path!;
-        final filename = result.files.single.name;
-        final format = filename.toLowerCase().endsWith('.epub') ? 'epub' : 'txt';
+      if (result != null && result.files.isNotEmpty) {
+        final picked = result.files.single;
+        final filename = picked.name;
+        final lowerName = filename.toLowerCase();
+        if (!lowerName.endsWith('.txt') && !lowerName.endsWith('.epub')) {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(content: Text('仅支持导入 TXT 或 EPUB 格式文件')),
+            );
+          }
+          return;
+        }
+
+        final format = lowerName.endsWith('.epub') ? 'epub' : 'txt';
         final title = filename.replaceAll(RegExp(r'\.(txt|epub)$', caseSensitive: false), '');
+        final safeName = filename.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_');
 
         final booksDir = await Storage.getBooksDir();
         final targetPath =
-            '${booksDir.path}${Platform.pathSeparator}${DateTime.now().millisecondsSinceEpoch}_$filename';
-        await File(srcPath).copy(targetPath);
+            '${booksDir.path}${Platform.pathSeparator}${DateTime.now().millisecondsSinceEpoch}_$safeName';
+
+        bool copied = false;
+        if (picked.path != null) {
+          try {
+            final srcFile = File(picked.path!);
+            if (await srcFile.exists()) {
+              await srcFile.copy(targetPath);
+              copied = true;
+            }
+          } catch (_) {}
+        }
+        if (!copied) {
+          final targetFile = File(targetPath);
+          if (picked.readStream != null) {
+            final sink = targetFile.openWrite();
+            try {
+              await sink.addStream(picked.readStream!);
+            } finally {
+              await sink.close();
+            }
+          } else if (picked.bytes != null) {
+            await targetFile.writeAsBytes(picked.bytes!, flush: true);
+          } else {
+            throw Exception('无法读取所选文件内容');
+          }
+        }
+
+        
 
         final newBook = Book(
           id: DateTime.now().millisecondsSinceEpoch.toString(),

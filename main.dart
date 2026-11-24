@@ -1126,13 +1126,14 @@ FlutterTts? _flutterTts;
 
     try {
       if (_config.type == TtsEngineType.system) {
+        final tts = await _ensureSystemTts();
         final targetLang = RegExp(r'[\u4e00-\u9fa5]').hasMatch(sentence.text) ? 'zh-CN' : 'en-US';
         if (_lastLang != targetLang) {
           _lastLang = targetLang;
-          await _flutterTts.setLanguage(targetLang);
+          await tts.setLanguage(targetLang);
         }
         if (token == _requestToken && _isPlaying && !_isPaused) {
-          await _flutterTts.speak(sentence.text);
+          await tts.speak(sentence.text);
         }
       } else if (_config.type == TtsEngineType.fishAudio) {
         await _callFishAudio(sentence.text, token);
@@ -1164,8 +1165,9 @@ FlutterTts? _flutterTts;
 
   Future<void> _playAudioBytes(Uint8List bytes, double speed, int token) async {
     if (token != _requestToken || !_isPlaying || _isPaused) return;
+    final player = _ensureAudioPlayer();
     try {
-      await _audioPlayer.play(BytesSource(bytes, mimeType: 'audio/mpeg'));
+      await player.play(BytesSource(bytes, mimeType: 'audio/mpeg'));
     } catch (_) {
       final tmpDir = await getTemporaryDirectory();
       final tmpFile = File(
@@ -1173,11 +1175,10 @@ FlutterTts? _flutterTts;
       );
       await tmpFile.writeAsBytes(bytes, flush: true);
       if (token != _requestToken || !_isPlaying || _isPaused) return;
-      await _audioPlayer.play(DeviceFileSource(tmpFile.path));
+      await player.play(DeviceFileSource(tmpFile.path));
     }
-
     try {
-      await _audioPlayer.setPlaybackRate(speed.clamp(0.5, 2.5));
+      await player.setPlaybackRate(speed.clamp(0.5, 2.5));
     } catch (_) {}
   }
 
@@ -1280,9 +1281,10 @@ FlutterTts? _flutterTts;
 
     try {
       if (config.type == TtsEngineType.system) {
-        await _flutterTts.setLanguage('zh-CN');
+        final tts = await _ensureSystemTts();
+        await tts.setLanguage('zh-CN');
         _lastLang = 'zh-CN';
-        await _flutterTts.speak(sample);
+        await tts.speak(sample);
       } else if (config.type == TtsEngineType.fishAudio) {
         await _callFishAudio(sample, token);
       } else {
@@ -1346,14 +1348,17 @@ FlutterTts? _flutterTts;
   }
 
   Future<void> _stopMedia() async {
-    try {
-      await _flutterTts.stop();
-    } catch (_) {}
-    try {
-      await _audioPlayer.stop();
-    } catch (_) {}
+    if (_flutterTts != null) {
+      try {
+        await _flutterTts!.stop();
+      } catch (_) {}
+    }
+    if (_audioPlayer != null) {
+      try {
+        await _audioPlayer!.stop();
+      } catch (_) {}
+    }
   }
-}
 
 // ==================== 书架主界面 ====================
 
@@ -1368,6 +1373,8 @@ class _ShelfScreenState extends State<ShelfScreen> {
   List<Book> _books = [];
   bool _einkMode = false;
   bool _importing = false;
+  bool _loading = true;
+  String? _initError;
 
   @override
   void initState() {
@@ -1376,16 +1383,26 @@ class _ShelfScreenState extends State<ShelfScreen> {
   }
 
   Future<void> _loadData() async {
-    await Storage.init();
-    final books = Storage.getBooks();
-    final eink = Storage.getEinkMode();
-    final currentTts = Storage.getActiveTtsEngine();
-    await TtsService().updateConfig(currentTts);
-    if (!mounted) return;
-    setState(() {
-      _books = books;
-      _einkMode = eink;
-    });
+    try {
+      await Storage.init();
+      final books = Storage.getBooks();
+      final eink = Storage.getEinkMode();
+      final currentTts = Storage.getActiveTtsEngine();
+      await TtsService().updateConfig(currentTts);
+      if (!mounted) return;
+      setState(() {
+        _books = books;
+        _einkMode = eink;
+        _loading = false;
+        _initError = null;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _initError = e.toString();
+      });
+    }
   }
 
   Future<void> _importBook() async {
@@ -1393,13 +1410,11 @@ class _ShelfScreenState extends State<ShelfScreen> {
     setState(() => _importing = true);
 
     try {
-            final result = await FilePicker.platform.pickFiles(
+      final PlatformFile? picked = await FilePicker.pickFile(
         type: FileType.any,
-        withReadStream: true,
       );
 
-      if (result != null && result.files.isNotEmpty) {
-        final picked = result.files.single;
+      if (picked != null) {
         final filename = picked.name;
         final lowerName = filename.toLowerCase();
         if (!lowerName.endsWith('.txt') && !lowerName.endsWith('.epub')) {
@@ -1431,17 +1446,16 @@ class _ShelfScreenState extends State<ShelfScreen> {
         }
         if (!copied) {
           final targetFile = File(targetPath);
-          if (picked.readStream != null) {
+          try {
             final sink = targetFile.openWrite();
             try {
-              await sink.addStream(picked.readStream!);
+              await sink.addStream(picked.readAsByteStream());
             } finally {
               await sink.close();
             }
-          } else if (picked.bytes != null) {
-            await targetFile.writeAsBytes(picked.bytes!, flush: true);
-          } else {
-            throw Exception('无法读取所选文件内容');
+          } catch (_) {
+            final bytes = await picked.readAsBytes();
+            await targetFile.writeAsBytes(bytes, flush: true);
           }
         }
 
@@ -1522,10 +1536,19 @@ class _ShelfScreenState extends State<ShelfScreen> {
           ),
         ],
       ),
-      body: _books.isEmpty
-          ? Center(
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
+      body: _loading
+          ? const Center(child: CircularProgressIndicator())
+          : _initError != null
+              ? Center(
+                  child: Padding(
+                    padding: const EdgeInsets.all(24),
+                    child: Text('初始化异常: $_initError', style: const TextStyle(color: Colors.red)),
+                  ),
+                )
+              : _books.isEmpty
+                  ? Center(
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
                 children: [
                   Icon(Icons.menu_book, size: 64, color: _einkMode ? Colors.black54 : Colors.grey),
                   const SizedBox(height: 16),
@@ -1979,7 +2002,6 @@ class _ReaderScreenState extends State<ReaderScreen> {
   }
 
   void _initTts() {
-    _tts.init();
     _ttsSub = _tts.onSentenceChange.listen((sentence) {
       if (!mounted) return;
       setState(() {

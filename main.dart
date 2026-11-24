@@ -4,16 +4,15 @@ import 'dart:io';
 import 'dart:isolate';
 import 'dart:math' as math;
 import 'package:archive/archive.dart';
-import 'package:audioplayers/audioplayers.dart';
 import 'package:fast_gbk/fast_gbk.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:flutter_tts/flutter_tts.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:xml/xml.dart';
+import 'tts_backend.dart';
 
 const String kDefaultFishVoiceId = 'cf71d823861b4e0eadff1672d646da36';
 
@@ -331,7 +330,6 @@ class Storage {
     if (Platform.isWindows) {
       try {
         final exeDir = File(Platform.resolvedExecutable).parent;
-        // 使用独立的 userdata 目录，避免与 Flutter 引擎自带的 data/ 资源目录冲突
         final userDataDir = Directory('${exeDir.path}${Platform.pathSeparator}userdata');
         if (!await userDataDir.exists()) {
           await userDataDir.create(recursive: true);
@@ -353,7 +351,6 @@ class Storage {
             }
           }
         } else {
-          // 兼容迁移旧版 data/settings.json
           final legacyFile = File(
             '${exeDir.path}${Platform.pathSeparator}data${Platform.pathSeparator}settings.json',
           );
@@ -579,14 +576,12 @@ class Storage {
       if (res.isEmpty) return _defaultTtsEngines();
 
       bool dirty = false;
-      // 迁移：为旧版未填默认发音人的 Fish.Audio 补充默认 voiceId
       for (int i = 0; i < res.length; i++) {
         if (res[i].id == 'fish_audio' && res[i].voiceId.trim().isEmpty) {
           res[i] = res[i].copyWith(voiceId: kDefaultFishVoiceId);
           dirty = true;
         }
       }
-      // 迁移：首次升级自动注入可编辑的 node55 中转引擎
       final hasNodeLunes = res.any((e) => e.id == 'builtin_node_lunes');
       if (!hasNodeLunes && _getBool(_keyNodeLunesInjected) != true) {
         res.add(_defaultNodeLunesEngine());
@@ -658,11 +653,9 @@ class BookParser {
   static String _decodeBytes(List<int> bytes) {
     if (bytes.isEmpty) return '';
 
-    // UTF-8 BOM
     if (bytes.length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF) {
       return utf8.decode(bytes.sublist(3), allowMalformed: true);
     }
-    // UTF-16 LE BOM
     if (bytes.length >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE) {
       final codeUnits = <int>[];
       for (int i = 2; i + 1 < bytes.length; i += 2) {
@@ -670,7 +663,6 @@ class BookParser {
       }
       return String.fromCharCodes(codeUnits);
     }
-    // UTF-16 BE BOM
     if (bytes.length >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF) {
       final codeUnits = <int>[];
       for (int i = 2; i + 1 < bytes.length; i += 2) {
@@ -1084,15 +1076,14 @@ class PageEngine {
   }
 }
 
-// ==================== TTS 朗读服务 (完全懒加载) ====================
+// ==================== TTS 朗读服务 (分平台原生后端) ====================
 
 class TtsService {
   static final TtsService _instance = TtsService._internal();
   factory TtsService() => _instance;
   TtsService._internal();
 
-  FlutterTts? _flutterTts;
-  AudioPlayer? _audioPlayer;
+  final TtsPlatformBackend _backend = TtsPlatformBackend();
 
   TtsEngineConfig _config = TtsEngineConfig(id: 'system', name: '系统原生 TTS');
   List<TtsSentence> _queue = [];
@@ -1100,12 +1091,8 @@ class TtsService {
   bool _isPlaying = false;
   bool _isPaused = false;
   bool _isTesting = false;
-  bool _systemTtsReady = false;
-  bool _audioPlayerReady = false;
   int _requestToken = 0;
   int _consecutiveErrors = 0;
-  String _lastLang = '';
-  String? _lastPlayerLogError;
 
   VoidCallback? onChapterComplete;
 
@@ -1124,77 +1111,13 @@ class TtsService {
   final StreamController<String> _errorController = StreamController<String>.broadcast();
   Stream<String> get onError => _errorController.stream;
 
-  Future<void> init() async {}
-
-  Future<FlutterTts> _ensureSystemTts() async {
-    final tts = _flutterTts ??= FlutterTts();
-    if (!_systemTtsReady) {
-      _systemTtsReady = true;
-      tts.setCompletionHandler(() {
-        if (_isTesting) {
-          stop();
-          return;
-        }
-        if (_isPlaying && !_isPaused) {
-          _consecutiveErrors = 0;
-          _playNext();
-        }
-      });
-      tts.setErrorHandler((msg) {
-        if (_isPlaying && !_isPaused) {
-          _handlePlaybackError('系统语音报错: $msg', _requestToken);
-        }
-      });
-      try {
-        await tts.awaitSpeakCompletion(false);
-      } catch (_) {}
-      try {
-        await tts.setSpeechRate((_config.speed * 0.5).clamp(0.0, 1.0));
-        await tts.setPitch(_config.pitch.clamp(0.5, 2.0));
-      } catch (_) {}
-    }
-    return tts;
-  }
-
-  AudioPlayer _ensureAudioPlayer() {
-    final player = _audioPlayer ??= AudioPlayer();
-    if (!_audioPlayerReady) {
-      _audioPlayerReady = true;
-      try {
-        player.setReleaseMode(ReleaseMode.stop);
-      } catch (_) {}
-      player.onPlayerComplete.listen((_) {
-        if (_isTesting) {
-          stop();
-          return;
-        }
-        if (_isPlaying && !_isPaused) {
-          _consecutiveErrors = 0;
-          _playNext();
-        }
-      });
-      player.onLog.listen((logMsg) {
-        final lower = logMsg.toLowerCase();
-        if (lower.contains('error') || lower.contains('exception') || lower.contains('failed')) {
-          _lastPlayerLogError = logMsg;
-          debugPrint('AudioPlayer log error: $logMsg');
-          if (_isPlaying && !_isPaused && !_isTesting) {
-            _handlePlaybackError('音频播放异常: $logMsg', _requestToken);
-          }
-        }
-      });
-    }
-    return player;
+  Future<void> init() async {
+    await _backend.init();
   }
 
   Future<void> updateConfig(TtsEngineConfig config) async {
     _config = config;
-    if (_flutterTts != null) {
-      try {
-        await _flutterTts!.setSpeechRate((config.speed * 0.5).clamp(0.0, 1.0));
-        await _flutterTts!.setPitch(config.pitch.clamp(0.5, 2.0));
-      } catch (_) {}
-    }
+    await _backend.configureSystemTts(speed: config.speed, pitch: config.pitch);
   }
 
   Future<void> startReading({
@@ -1244,15 +1167,26 @@ class TtsService {
 
     try {
       if (_config.type == TtsEngineType.system) {
-        final tts = await _ensureSystemTts();
         final targetLang = RegExp(r'[\u4e00-\u9fa5]').hasMatch(sentence.text) ? 'zh-CN' : 'en-US';
-        if (_lastLang != targetLang) {
-          _lastLang = targetLang;
-          await tts.setLanguage(targetLang);
-        }
-        if (token == _requestToken && _isPlaying && !_isPaused) {
-          await tts.speak(sentence.text);
-        }
+        await _backend.speakSystemText(
+          text: sentence.text,
+          lang: targetLang,
+          speed: _config.speed,
+          pitch: _config.pitch,
+          onComplete: () {
+            if (_isTesting) {
+              stop();
+              return;
+            }
+            if (token == _requestToken && _isPlaying && !_isPaused) {
+              _consecutiveErrors = 0;
+              _playNext();
+            }
+          },
+          onError: (msg) {
+            _handlePlaybackError(msg, token);
+          },
+        );
       } else if (_config.type == TtsEngineType.fishAudio) {
         await _callFishAudio(sentence.text, token);
       } else if (_config.type == TtsEngineType.customHttp) {
@@ -1309,43 +1243,37 @@ class TtsService {
       throw Exception('接口返回的音频数据为空');
     }
     if (token != _requestToken || !_isPlaying || _isPaused) return;
-    final player = _ensureAudioPlayer();
-    _lastPlayerLogError = null;
-
-    try {
-      await player.stop();
-    } catch (_) {}
-    if (token != _requestToken || !_isPlaying || _isPaused) return;
 
     final ext = _detectAudioExtension(bytes);
-    bool played = false;
-    try {
-      // 优先落盘为临时文件并通过 DeviceFileSource 播放，避免 Android BytesSource 兼容性问题
-      final tmpDir = await getTemporaryDirectory();
-      final tmpFile = File(
-        '${tmpDir.path}${Platform.pathSeparator}tts_cache_${token % 6}.$ext',
-      );
-      await tmpFile.writeAsBytes(bytes, flush: true);
-      if (token != _requestToken || !_isPlaying || _isPaused) return;
-      await player.play(DeviceFileSource(tmpFile.path));
-      played = true;
-    } catch (_) {}
+    final mimeType = ext == 'wav' ? 'audio/wav' : (ext == 'ogg' ? 'audio/ogg' : 'audio/mpeg');
+    final tmpDir = await getTemporaryDirectory();
+    final tmpFile = File(
+      '${tmpDir.path}${Platform.pathSeparator}tts_cache_${token % 6}.$ext',
+    );
+    await tmpFile.writeAsBytes(bytes, flush: true);
 
-    if (!played) {
-      if (token != _requestToken || !_isPlaying || _isPaused) return;
-      await player.play(
-        BytesSource(
-          bytes,
-          mimeType: ext == 'wav' ? 'audio/wav' : (ext == 'ogg' ? 'audio/ogg' : 'audio/mpeg'),
-        ),
-      );
-    }
+    if (token != _requestToken || !_isPlaying || _isPaused) return;
 
-    if (!serverAppliedSpeed && (speed - 1.0).abs() >= 0.05) {
-      try {
-        await player.setPlaybackRate(speed.clamp(0.5, 2.5));
-      } catch (_) {}
-    }
+    await _backend.playAudioFile(
+      filePath: tmpFile.path,
+      bytes: bytes,
+      mimeType: mimeType,
+      speed: speed,
+      serverAppliedSpeed: serverAppliedSpeed,
+      onComplete: () {
+        if (_isTesting) {
+          stop();
+          return;
+        }
+        if (token == _requestToken && _isPlaying && !_isPaused) {
+          _consecutiveErrors = 0;
+          _playNext();
+        }
+      },
+      onError: (msg) {
+        _handlePlaybackError(msg, token);
+      },
+    );
   }
 
   String _cleanApiKey(String raw) {
@@ -1532,14 +1460,22 @@ class TtsService {
     final token = ++_requestToken;
     _isPlaying = true;
     _isPaused = false;
-    _lastPlayerLogError = null;
+    _backend.consumeLastPlayerError();
 
+    String? asyncErr;
     try {
       if (config.type == TtsEngineType.system) {
-        final tts = await _ensureSystemTts();
-        await tts.setLanguage('zh-CN');
-        _lastLang = 'zh-CN';
-        await tts.speak(sample);
+        await _backend.speakSystemText(
+          text: sample,
+          lang: 'zh-CN',
+          speed: config.speed,
+          pitch: config.pitch,
+          onComplete: () => stop(),
+          onError: (msg) {
+            asyncErr = msg;
+            stop();
+          },
+        );
       } else if (config.type == TtsEngineType.fishAudio) {
         await _callFishAudio(sample, token);
       } else {
@@ -1547,10 +1483,10 @@ class TtsService {
       }
 
       await Future.delayed(const Duration(milliseconds: 250));
-      if (_lastPlayerLogError != null) {
-        final err = _lastPlayerLogError!;
+      final playerErr = asyncErr ?? _backend.consumeLastPlayerError();
+      if (playerErr != null) {
         await stop();
-        return '音频播放器报错: $err';
+        return playerErr;
       }
       return null;
     } catch (e) {
@@ -1568,7 +1504,7 @@ class TtsService {
   Future<void> nextSentence() async {
     if (!_isPlaying) return;
     _requestToken++;
-    await _stopMedia();
+    await _backend.stopAll();
     if (!_isPlaying) return;
     _isPaused = false;
     _stateController.add(true);
@@ -1579,7 +1515,7 @@ class TtsService {
   Future<void> prevSentence() async {
     if (!_isPlaying) return;
     _requestToken++;
-    await _stopMedia();
+    await _backend.stopAll();
     if (!_isPlaying) return;
     _isPaused = false;
     _stateController.add(true);
@@ -1591,7 +1527,7 @@ class TtsService {
     _isPaused = true;
     _requestToken++;
     _stateController.add(false);
-    await _stopMedia();
+    await _backend.stopAll();
   }
 
   Future<void> resume() async {
@@ -1607,20 +1543,7 @@ class TtsService {
     _isTesting = false;
     _requestToken++;
     _stateController.add(false);
-    await _stopMedia();
-  }
-
-  Future<void> _stopMedia() async {
-    if (_flutterTts != null) {
-      try {
-        await _flutterTts!.stop();
-      } catch (_) {}
-    }
-    if (_audioPlayer != null) {
-      try {
-        await _audioPlayer!.stop();
-      } catch (_) {}
-    }
+    await _backend.stopAll();
   }
 }
 
@@ -2680,7 +2603,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
                 ],
               ),
 
-              // 触控与滑动翻页区域（菜单展开时点击任意处关闭菜单）
+              // 触控与滑动翻页区域
               GestureDetector(
                 behavior: HitTestBehavior.translucent,
                 onHorizontalDragEnd: (details) {

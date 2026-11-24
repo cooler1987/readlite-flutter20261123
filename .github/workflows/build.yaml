@@ -52,7 +52,7 @@ jobs:
   # ==================== 2. PC 桌面便携版构建 (Windows X64 Portable) ====================
   build-windows:
     name: Build Windows X64 Portable
-    runs-on: windows-latest
+    runs-on: windows-2022
 
     steps:
       - name: 检出仓库代码
@@ -61,9 +61,10 @@ jobs:
       - name: 配置 MSVC 环境
         uses: ilammy/msvc-dev-cmd@v1
 
-      - name: 配置 Flutter 环境
+      - name: 配置稳定版 Flutter 3.44.9 (原生 Skia 渲染)
         uses: subosito/flutter-action@v2
         with:
+          flutter-version: '3.44.9'
           channel: 'stable'
           cache: true
 
@@ -77,24 +78,12 @@ jobs:
           Copy-Item pubspec.yaml.bak pubspec.yaml -Force
           if (Test-Path lib) { Remove-Item -Recurse -Force lib }
 
-      - name: 关闭 Impeller 切回 Skia 并加固运行库兼容性
+      - name: 注入旧系统兼容宏
         run: |
-          $mainCpp = "windows\runner\main.cpp"
-          $cpp = Get-Content $mainCpp -Raw -Encoding UTF8
-          $target = 'flutter::DartProject project(L"data");'
-          if (-not $cpp.Contains($target)) {
-            Write-Error "未找到 DartProject 初始化行，无法配置 Skia 渲染"
-            exit 1
-          }
-          if (-not $cpp.Contains("set_impeller_switch")) {
-            $cpp = $cpp.Replace($target, "$target`r`n  project.set_impeller_switch(flutter::ImpellerSwitch::Disabled);")
-            Set-Content $mainCpp $cpp -Encoding UTF8
-          }
-
           $cmake = "windows\CMakeLists.txt"
           $cmakeTxt = Get-Content $cmake -Raw -Encoding UTF8
           if (-not $cmakeTxt.Contains("_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR")) {
-            $cmakeTxt = $cmakeTxt -replace '(?m)^(project\([^\r\n]+\))', "`$1`r`nadd_compile_definitions(_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR)"
+            $cmakeTxt = $cmakeTxt -replace '(?m)^(project\([^\r\n]+\))', ('$1' + "`r`nadd_compile_definitions(_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR)")
             Set-Content $cmake $cmakeTxt -Encoding UTF8
           }
 
@@ -104,20 +93,28 @@ jobs:
       - name: 编译 Windows X64 Release
         run: flutter build windows --release -t main.dart
 
-      - name: 内嵌 VC++ 运行库并打包为 X64 绿色便携版 ZIP
+      - name: 内嵌完整 VC++ 运行库 DLL
         run: |
           $releaseDir = "build\windows\x64\runner\Release"
-          foreach ($dll in @("msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll")) {
+          $dlls = @(
+            "msvcp140.dll",
+            "msvcp140_1.dll",
+            "msvcp140_2.dll",
+            "msvcp140_atomic_wait.dll",
+            "vcruntime140.dll",
+            "vcruntime140_1.dll",
+            "concrt140.dll"
+          )
+          foreach ($dll in $dlls) {
             $src = "C:\Windows\System32\$dll"
             if (Test-Path $src) {
               Copy-Item $src -Destination $releaseDir -Force
             }
           }
-          Compress-Archive -Path "$releaseDir\*" -DestinationPath weread-lite-windows-x64-portable.zip -Force
 
-      - name: 归档上传 Windows X64 便携版 ZIP
+      - name: 归档上传 Windows X64 便携版 (单层 ZIP，不套娃)
         uses: actions/upload-artifact@v4
         with:
           name: weread-lite-windows-x64-portable
-          path: weread-lite-windows-x64-portable.zip
+          path: build/windows/x64/runner/Release
           retention-days: 7

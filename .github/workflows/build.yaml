@@ -23,24 +23,41 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: 配置 Flutter 环境
+      - name: 配置 Flutter 3.44.9
         uses: subosito/flutter-action@v2
         with:
+          flutter-version: '3.44.9'
           channel: 'stable'
           cache: true
 
-      - name: 云端补齐 Android 工程
+      - name: 云端补齐 Android 工程与标准入口
         run: |
           cp pubspec.yaml pubspec.yaml.bak
           flutter create . --platforms=android --project-name weread_lite_flutter
           cp pubspec.yaml.bak pubspec.yaml
-          rm -rf lib
+          mkdir -p lib
+          cp main.dart lib/main.dart
+          cp tts_backend_mobile.dart lib/tts_backend.dart
+
+      - name: 配置 Android 网络权限与明文 HTTP 支持
+        run: |
+          python3 - <<'EOF'
+          p = "android/app/src/main/AndroidManifest.xml"
+          with open(p, "r", encoding="utf-8") as f:
+              xml = f.read()
+          if "android.permission.INTERNET" not in xml:
+              xml = xml.replace("<application", '    <uses-permission android:name="android.permission.INTERNET"/>\n    <application', 1)
+          if "usesCleartextTraffic" not in xml:
+              xml = xml.replace("<application", '<application android:usesCleartextTraffic="true"', 1)
+          with open(p, "w", encoding="utf-8") as f:
+              f.write(xml)
+          EOF
 
       - name: 安装依赖
         run: flutter pub get
 
       - name: 编译 Android APK (arm64-v8a)
-        run: flutter build apk --release --target-platform android-arm64 --split-per-abi -t main.dart
+        run: flutter build apk --release --target-platform android-arm64 --split-per-abi
 
       - name: 归档上传 APK 安装包
         uses: actions/upload-artifact@v4
@@ -61,7 +78,7 @@ jobs:
       - name: 配置 MSVC 环境
         uses: ilammy/msvc-dev-cmd@v1
 
-      - name: 配置稳定版 Flutter 3.44.9 (原生 Skia 渲染)
+      - name: 配置 Flutter 3.44.9
         uses: subosito/flutter-action@v2
         with:
           flutter-version: '3.44.9'
@@ -71,44 +88,86 @@ jobs:
       - name: 启用 Windows 桌面支持
         run: flutter config --enable-windows-desktop
 
-      - name: 云端补齐 Windows 桌面宿主
+      - name: 云端补齐 Windows 工程并剥离高危原生音频插件
         run: |
           Copy-Item pubspec.yaml pubspec.yaml.bak
           flutter create . --platforms=windows --project-name weread_lite_flutter
-          Copy-Item pubspec.yaml.bak pubspec.yaml -Force
-          if (Test-Path lib) { Remove-Item -Recurse -Force lib }
+          $pub = Get-Content pubspec.yaml.bak -Raw -Encoding UTF8
+          $pub = $pub -replace '(?m)^\s*flutter_tts:[^\r\n]*\r?\n?', ''
+          $pub = $pub -replace '(?m)^\s*audioplayers:[^\r\n]*\r?\n?', ''
+          [System.IO.File]::WriteAllText((Resolve-Path pubspec.yaml).Path, $pub, [System.Text.UTF8Encoding]::new($false))
+          New-Item -ItemType Directory -Force -Path lib | Out-Null
+          Copy-Item main.dart lib\main.dart -Force
+          Copy-Item tts_backend_win.dart lib\tts_backend.dart -Force
 
-      - name: 注入旧系统兼容宏
+      - name: 注入 Win10 1909 兼容宏、立即显示窗口与原生崩溃弹窗
         run: |
-          $cmake = "windows\CMakeLists.txt"
-          $cmakeTxt = Get-Content $cmake -Raw -Encoding UTF8
+          $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+
+          $cmakePath = (Resolve-Path "windows\CMakeLists.txt").Path
+          $cmakeTxt = [System.IO.File]::ReadAllText($cmakePath, $utf8NoBom)
           if (-not $cmakeTxt.Contains("_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR")) {
             $cmakeTxt = $cmakeTxt -replace '(?m)^(project\([^\r\n]+\))', ('$1' + "`r`nadd_compile_definitions(_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR)")
-            Set-Content $cmake $cmakeTxt -Encoding UTF8
+            [System.IO.File]::WriteAllText($cmakePath, $cmakeTxt, $utf8NoBom)
+          }
+
+          $fwPath = (Resolve-Path "windows\runner\flutter_window.cpp").Path
+          $fwTxt = [System.IO.File]::ReadAllText($fwPath, $utf8NoBom)
+          $fwTxt = $fwTxt -replace 'flutter_controller_->ForceRedraw\(\);', "flutter_controller_->ForceRedraw();`r`n  this->Show();"
+          [System.IO.File]::WriteAllText($fwPath, $fwTxt, $utf8NoBom)
+
+          $mainPath = (Resolve-Path "windows\runner\main.cpp").Path
+          $mainTxt = [System.IO.File]::ReadAllText($mainPath, $utf8NoBom)
+          $crashHook = @'
+#include <windows.h>
+#include <stdio.h>
+
+static LONG WINAPI WereadUnhandledCrashFilter(EXCEPTION_POINTERS* info) {
+  wchar_t msg[512] = {};
+  unsigned long code = info && info->ExceptionRecord ? info->ExceptionRecord->ExceptionCode : 0;
+  void* addr = info && info->ExceptionRecord ? info->ExceptionRecord->ExceptionAddress : nullptr;
+  swprintf_s(msg, 512, L"程序启动发生原生异常，错误码: 0x%08lX\n地址: %p", code, addr);
+  MessageBoxW(nullptr, msg, L"Weread Lite 启动错误", MB_OK | MB_ICONERROR);
+  return EXCEPTION_EXECUTE_HANDLER;
+}
+
+'@
+          if (-not $mainTxt.Contains("WereadUnhandledCrashFilter")) {
+            $mainTxt = $mainTxt -replace 'int APIENTRY wWinMain', ($crashHook + 'int APIENTRY wWinMain')
+            $mainTxt = $mainTxt -replace '(int APIENTRY wWinMain\([^\)]*\)\s*\{)', ('$1' + "`r`n  SetUnhandledExceptionFilter(WereadUnhandledCrashFilter);")
+            [System.IO.File]::WriteAllText($mainPath, $mainTxt, $utf8NoBom)
           }
 
       - name: 安装依赖
         run: flutter pub get
 
       - name: 编译 Windows X64 Release
-        run: flutter build windows --release -t main.dart
+        run: flutter build windows --release
 
-      - name: 内嵌完整 VC++ 运行库 DLL
+      - name: 内嵌配套 VC++ 运行库 CRT DLL
         run: |
           $releaseDir = "build\windows\x64\runner\Release"
-          $dlls = @(
-            "msvcp140.dll",
-            "msvcp140_1.dll",
-            "msvcp140_2.dll",
-            "msvcp140_atomic_wait.dll",
-            "vcruntime140.dll",
-            "vcruntime140_1.dll",
-            "concrt140.dll"
-          )
-          foreach ($dll in $dlls) {
-            $src = "C:\Windows\System32\$dll"
-            if (Test-Path $src) {
-              Copy-Item $src -Destination $releaseDir -Force
+          $crtDirs = @()
+          if ($env:VCToolsRedistDir -and (Test-Path "$($env:VCToolsRedistDir)\x64\Microsoft.VC143.CRT")) {
+            $crtDirs += "$($env:VCToolsRedistDir)\x64\Microsoft.VC143.CRT"
+          }
+          $crtDirs += Get-ChildItem "C:\Program Files\Microsoft Visual Studio" -Recurse -Directory -Filter "Microsoft.VC143.CRT" -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -like "*\x64\*" } |
+            Select-Object -ExpandProperty FullName
+          $copied = $false
+          foreach ($dir in $crtDirs) {
+            if (Test-Path $dir) {
+              Copy-Item "$dir\*.dll" -Destination $releaseDir -Force
+              $copied = $true
+              break
+            }
+          }
+          if (-not $copied) {
+            Write-Warning "未找到 VC143.CRT 目录，回退到 System32"
+            foreach ($dll in @("msvcp140.dll","msvcp140_1.dll","msvcp140_2.dll","msvcp140_atomic_wait.dll","vcruntime140.dll","vcruntime140_1.dll","concrt140.dll")) {
+              if (Test-Path "C:\Windows\System32\$dll") {
+                Copy-Item "C:\Windows\System32\$dll" -Destination $releaseDir -Force
+              }
             }
           }
 

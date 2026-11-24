@@ -306,7 +306,7 @@ class Storage {
       }
     }
 
-  try {
+    try {
       _prefs = await SharedPreferences.getInstance().timeout(
         const Duration(seconds: 3),
       );
@@ -550,8 +550,6 @@ class BookParser {
     });
   }
 
-  // ---------- 文本解码 (支持 UTF-8 / UTF-16 LE & BE / GBK / GB18030) ----------
-
   static String _decodeBytes(List<int> bytes) {
     if (bytes.isEmpty) return '';
 
@@ -652,7 +650,6 @@ class BookParser {
       final end = (i + 1 < matches.length) ? matches[i + 1].start : content.length;
       final body = content.substring(start, end).trim();
 
-      // 跳过纯空卷标，避免 TTS 与阅读翻页停滞
       if (body.isEmpty) continue;
 
       chapters.add(Chapter(
@@ -677,8 +674,6 @@ class BookParser {
   }
 
   static bool _isLowSurrogate(int codeUnit) => codeUnit >= 0xDC00 && codeUnit <= 0xDFFF;
-
-  // ==================== EPUB 解析 ====================
 
   static ArchiveFile? _findArchiveFile(Archive archive, String path) {
     final normalized = _normalizePath(path.replaceAll('\\', '/'));
@@ -763,7 +758,6 @@ class BookParser {
       final text = _cleanHtml(htmlContent);
       if (text.isEmpty) continue;
 
-      // 优先提取正文内的 <h1>-<h3>，其次才是 <title>（避免整本书每章标题都显示书名）
       String title = '';
       final hMatch = RegExp(
         r'<h[1-3][^>]*>([\s\S]*?)</h[1-3]>',
@@ -838,7 +832,6 @@ class BookParser {
         .replaceAll('&rsquo;', '’')
         .replaceAll('&hellip;', '…');
 
-    // 解码十进制与十六进制数字实体 (如 &#160; / &#x2014;)
     text = text.replaceAllMapped(RegExp(r'&#(\d+);'), (m) {
       final code = int.tryParse(m.group(1) ?? '');
       return (code != null && code > 0 && code <= 0x10FFFF)
@@ -852,7 +845,6 @@ class BookParser {
           : m.group(0)!;
     });
 
-    // 清理 HTML 源码缩进导致的每行首尾多余半角空格（保留中文全角缩进 \u3000）
     text = text
         .split('\n')
         .map((line) => line.replaceAll(RegExp(r'^[ \t]+|[ \t]+$'), ''))
@@ -875,7 +867,6 @@ class PageEngine {
       return [0];
     }
 
-    // 根据区域面积与字号动态估算每页采样窗口，大幅减少长章节重复布局耗时
     final fontSize = (style.fontSize ?? 18.0).clamp(10.0, 60.0);
     final lineHeight = (style.height ?? 1.5).clamp(1.0, 3.0);
     final scaledFontSize = textScaler.scale(fontSize);
@@ -912,7 +903,6 @@ class PageEngine {
         if (pos.offset > lastVisibleLineEnd) {
           lastVisibleLineEnd = pos.offset;
         }
-        // 消费行尾单个换行符，防止下一页顶部出现多余空行或空行不前进
         if (lastVisibleLineEnd < chunk.length && chunk.codeUnitAt(lastVisibleLineEnd) == 0x0A) {
           lastVisibleLineEnd++;
         }
@@ -947,7 +937,6 @@ class PageEngine {
     return 0;
   }
 
-  /// 切分自然句子（避免小数点误切，对超长无标点段落进行合理分段防接口超时）
   static List<TtsSentence> splitSentences(String text, int chapterIndex) {
     final sentencePattern = RegExp(
       r'(?:[^。！？!?;；\n\r.]|(?<=\d)\.(?=\d))+[。！？!?;；\n\r.]*[”’"\x27）)』」]*',
@@ -990,14 +979,14 @@ class PageEngine {
   }
 }
 
-// ==================== TTS 朗读服务 ====================
+// ==================== TTS 朗读服务 (完全懒加载) ====================
 
 class TtsService {
   static final TtsService _instance = TtsService._internal();
   factory TtsService() => _instance;
   TtsService._internal();
 
-FlutterTts? _flutterTts;
+  FlutterTts? _flutterTts;
   AudioPlayer? _audioPlayer;
 
   TtsEngineConfig _config = TtsEngineConfig(id: 'system', name: '系统原生 TTS');
@@ -1268,7 +1257,6 @@ FlutterTts? _flutterTts;
     }
   }
 
-  /// 在设置窗口中测试当前引擎配置（成功返回 null，失败返回原因）
   Future<String?> testConfig(TtsEngineConfig config) async {
     await stop();
     await init();
@@ -1359,7 +1347,7 @@ FlutterTts? _flutterTts;
       } catch (_) {}
     }
   }
-
+}
 // ==================== 书架主界面 ====================
 
 class ShelfScreen extends StatefulWidget {
@@ -1459,8 +1447,6 @@ class _ShelfScreenState extends State<ShelfScreen> {
           }
         }
 
-        
-
         final newBook = Book(
           id: DateTime.now().millisecondsSinceEpoch.toString(),
           title: title,
@@ -1549,96 +1535,104 @@ class _ShelfScreenState extends State<ShelfScreen> {
                   ? Center(
                       child: Column(
                         mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  Icon(Icons.menu_book, size: 64, color: _einkMode ? Colors.black54 : Colors.grey),
-                  const SizedBox(height: 16),
-                  Text('书架暂无图书', style: TextStyle(fontSize: 18, color: textColor ?? Colors.grey)),
-                  const SizedBox(height: 8),
-                  ElevatedButton.icon(
-                    icon: const Icon(Icons.file_open),
-                    label: const Text('导入 TXT 或 EPUB 文件'),
-                    onPressed: _importing ? null : _importBook,
-                  ),
-                ],
-              ),
-            )
-          : ListView.separated(
-              padding: const EdgeInsets.all(12),
-              itemCount: _books.length,
-              separatorBuilder: (_, __) =>
-                  Divider(height: 1, color: _einkMode ? Colors.black26 : null),
-              itemBuilder: (context, index) {
-                final book = _books[index];
-                return ListTile(
-                  tileColor: cardColor,
-                  leading: Container(
-                    width: 44,
-                    height: 56,
-                    decoration: BoxDecoration(
-                      color: _einkMode ? Colors.white : Colors.blueGrey.shade50,
-                      border: Border.all(color: _einkMode ? Colors.black : Colors.black26),
-                      borderRadius: BorderRadius.circular(4),
-                    ),
-                    alignment: Alignment.center,
-                    child: Text(
-                      book.format.toUpperCase(),
-                      style: TextStyle(
-                        fontWeight: FontWeight.bold,
-                        fontSize: 12,
-                        color: _einkMode ? Colors.black : Colors.blueGrey.shade800,
-                      ),
-                    ),
-                  ),
-                  title: Text(
-                    book.title,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(fontWeight: FontWeight.w600, color: textColor),
-                  ),
-                  subtitle: Text(
-                    '读至第 ${book.currentChapterIndex + 1} 章 · 进度 ${(book.progress * 100).toStringAsFixed(1)}%',
-                    style: TextStyle(color: _einkMode ? Colors.black87 : Colors.grey.shade600),
-                  ),
-                  trailing: Icon(Icons.chevron_right, color: textColor),
-                  onTap: () async {
-                    await Navigator.push(
-                      context,
-                      MaterialPageRoute(builder: (_) => ReaderScreen(book: book)),
-                    );
-                    _loadData();
-                  },
-                  onLongPress: () {
-                    showDialog(
-                      context: context,
-                      builder: (ctx) => AlertDialog(
-                        title: Text('删除 《${book.title}》？'),
-                        content: const Text('将从书架移除，并清理本地副本及关联书签。'),
-                        actions: [
-                          TextButton(
-                            onPressed: () => Navigator.pop(ctx),
-                            child: const Text('取消'),
+                        children: [
+                          Icon(
+                            Icons.menu_book,
+                            size: 64,
+                            color: _einkMode ? Colors.black54 : Colors.grey,
                           ),
-                          ElevatedButton(
-                            onPressed: () async {
-                              final f = File(book.filePath);
-                              if (await f.exists()) {
-                                try {
-                                  await f.delete();
-                                } catch (_) {}
-                              }
-                              await Storage.removeBook(book.id);
-                              if (ctx.mounted) Navigator.pop(ctx);
-                              _loadData();
-                            },
-                            child: const Text('删除'),
+                          const SizedBox(height: 16),
+                          Text(
+                            '书架暂无图书',
+                            style: TextStyle(fontSize: 18, color: textColor ?? Colors.grey),
+                          ),
+                          const SizedBox(height: 8),
+                          ElevatedButton.icon(
+                            icon: const Icon(Icons.file_open),
+                            label: const Text('导入 TXT 或 EPUB 文件'),
+                            onPressed: _importing ? null : _importBook,
                           ),
                         ],
                       ),
-                    );
-                  },
-                );
-              },
-            ),
+                    )
+                  : ListView.separated(
+                      padding: const EdgeInsets.all(12),
+                      itemCount: _books.length,
+                      separatorBuilder: (_, __) =>
+                          Divider(height: 1, color: _einkMode ? Colors.black26 : null),
+                      itemBuilder: (context, index) {
+                        final book = _books[index];
+                        return ListTile(
+                          tileColor: cardColor,
+                          leading: Container(
+                            width: 44,
+                            height: 56,
+                            decoration: BoxDecoration(
+                              color: _einkMode ? Colors.white : Colors.blueGrey.shade50,
+                              border: Border.all(color: _einkMode ? Colors.black : Colors.black26),
+                              borderRadius: BorderRadius.circular(4),
+                            ),
+                            alignment: Alignment.center,
+                            child: Text(
+                              book.format.toUpperCase(),
+                              style: TextStyle(
+                                fontWeight: FontWeight.bold,
+                                fontSize: 12,
+                                color: _einkMode ? Colors.black : Colors.blueGrey.shade800,
+                              ),
+                            ),
+                          ),
+                          title: Text(
+                            book.title,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(fontWeight: FontWeight.w600, color: textColor),
+                          ),
+                          subtitle: Text(
+                            '读至第 ${book.currentChapterIndex + 1} 章 · 进度 ${(book.progress * 100).toStringAsFixed(1)}%',
+                            style:
+                                TextStyle(color: _einkMode ? Colors.black87 : Colors.grey.shade600),
+                          ),
+                          trailing: Icon(Icons.chevron_right, color: textColor),
+                          onTap: () async {
+                            await Navigator.push(
+                              context,
+                              MaterialPageRoute(builder: (_) => ReaderScreen(book: book)),
+                            );
+                            _loadData();
+                          },
+                          onLongPress: () {
+                            showDialog(
+                              context: context,
+                              builder: (ctx) => AlertDialog(
+                                title: Text('删除 《${book.title}》？'),
+                                content: const Text('将从书架移除，并清理本地副本及关联书签。'),
+                                actions: [
+                                  TextButton(
+                                    onPressed: () => Navigator.pop(ctx),
+                                    child: const Text('取消'),
+                                  ),
+                                  ElevatedButton(
+                                    onPressed: () async {
+                                      final f = File(book.filePath);
+                                      if (await f.exists()) {
+                                        try {
+                                          await f.delete();
+                                        } catch (_) {}
+                                      }
+                                      await Storage.removeBook(book.id);
+                                      if (ctx.mounted) Navigator.pop(ctx);
+                                      _loadData();
+                                    },
+                                    child: const Text('删除'),
+                                  ),
+                                ],
+                              ),
+                            );
+                          },
+                        );
+                      },
+                    ),
     );
   }
 }
@@ -1810,7 +1804,8 @@ class _TtsSettingsDialogState extends State<TtsSettingsDialog> {
                   ),
                 ),
               ] else if (_current.type == TtsEngineType.customHttp) ...[
-                const Text('自定义通用 HTTP / OpenAI TTS', style: TextStyle(fontWeight: FontWeight.bold)),
+                const Text('自定义通用 HTTP / OpenAI TTS',
+                    style: TextStyle(fontWeight: FontWeight.bold)),
                 const SizedBox(height: 8),
                 TextField(
                   controller: _endpointCtrl,
@@ -2534,7 +2529,8 @@ class _ReaderScreenState extends State<ReaderScreen> {
                         ),
                         Row(
                           children: [
-                            const Text('行距', style: TextStyle(color: Colors.white70, fontSize: 12)),
+                            const Text('行距',
+                                style: TextStyle(color: Colors.white70, fontSize: 12)),
                             Expanded(
                               child: Slider(
                                 value: _lineHeight.clamp(1.2, 2.4),
@@ -2554,7 +2550,8 @@ class _ReaderScreenState extends State<ReaderScreen> {
                                 },
                               ),
                             ),
-                            const Text('边距', style: TextStyle(color: Colors.white70, fontSize: 12)),
+                            const Text('边距',
+                                style: TextStyle(color: Colors.white70, fontSize: 12)),
                             Expanded(
                               child: Slider(
                                 value: _margin.clamp(8.0, 40.0),

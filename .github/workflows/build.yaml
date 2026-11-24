@@ -5,12 +5,12 @@ on:
     branches: [ main, master ]
   pull_request:
     branches: [ main, master ]
-  workflow_dispatch: # 支持在 GitHub 网页手动一键触发打包
+  workflow_dispatch:
 
 jobs:
-  # ==================== 1. 安卓端构建 (Android APK) ====================
+  # ==================== 1. 安卓端构建 (仅 arm64-v8a) ====================
   build-android:
-    name: Build Android APK
+    name: Build Android APK (arm64-v8a)
     runs-on: ubuntu-latest
 
     steps:
@@ -29,7 +29,7 @@ jobs:
           channel: 'stable'
           cache: true
 
-      - name: 云端补齐平台工程 (指定项目名，规避仓库名中划线)
+      - name: 云端补齐 Android 工程
         run: |
           cp pubspec.yaml pubspec.yaml.bak
           flutter create . --platforms=android --project-name weread_lite_flutter
@@ -39,26 +39,26 @@ jobs:
       - name: 安装依赖
         run: flutter pub get
 
-      - name: 编译 Android APK (显式指向根目录 main.dart)
-        run: flutter build apk --release --split-per-abi -t main.dart
+      - name: 编译 Android APK (arm64-v8a)
+        run: flutter build apk --release --target-platform android-arm64 --split-per-abi -t main.dart
 
       - name: 归档上传 APK 安装包
         uses: actions/upload-artifact@v4
         with:
-          name: weread-lite-android-apks
-          path: build/app/outputs/flutter-apk/*.apk
+          name: weread-lite-android-arm64
+          path: build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
           retention-days: 7
 
-  # ==================== 2. PC 桌面便携版构建 (Windows Portable) ====================
+  # ==================== 2. PC 桌面便携版构建 (Windows X64 Portable) ====================
   build-windows:
-    name: Build Windows PC Portable
+    name: Build Windows X64 Portable
     runs-on: windows-latest
 
     steps:
       - name: 检出仓库代码
         uses: actions/checkout@v4
 
-      - name: 配置 MSVC 环境 (激活 VS 2022 编译工具链)
+      - name: 配置 MSVC 环境
         uses: ilammy/msvc-dev-cmd@v1
 
       - name: 配置 Flutter 环境
@@ -67,31 +67,57 @@ jobs:
           channel: 'stable'
           cache: true
 
-      - name: 启用 Windows 桌面开发支持
+      - name: 启用 Windows 桌面支持
         run: flutter config --enable-windows-desktop
 
-      - name: 云端补齐 Windows 桌面宿主 (指定项目名，规避仓库名中划线)
+      - name: 云端补齐 Windows 桌面宿主
         run: |
           Copy-Item pubspec.yaml pubspec.yaml.bak
           flutter create . --platforms=windows --project-name weread_lite_flutter
           Copy-Item pubspec.yaml.bak pubspec.yaml -Force
           if (Test-Path lib) { Remove-Item -Recurse -Force lib }
 
+      - name: 关闭 Impeller 切回 Skia 并加固运行库兼容性
+        run: |
+          $mainCpp = "windows\runner\main.cpp"
+          $cpp = Get-Content $mainCpp -Raw -Encoding UTF8
+          $target = 'flutter::DartProject project(L"data");'
+          if (-not $cpp.Contains($target)) {
+            Write-Error "未找到 DartProject 初始化行，无法配置 Skia 渲染"
+            exit 1
+          }
+          if (-not $cpp.Contains("set_impeller_switch")) {
+            $cpp = $cpp.Replace($target, "$target`r`n  project.set_impeller_switch(flutter::ImpellerSwitch::Disabled);")
+            Set-Content $mainCpp $cpp -Encoding UTF8
+          }
+
+          $cmake = "windows\CMakeLists.txt"
+          $cmakeTxt = Get-Content $cmake -Raw -Encoding UTF8
+          if (-not $cmakeTxt.Contains("_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR")) {
+            $cmakeTxt = $cmakeTxt -replace '(?m)^(project\([^\r\n]+\))', "`$1`r`nadd_compile_definitions(_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR)"
+            Set-Content $cmake $cmakeTxt -Encoding UTF8
+          }
+
       - name: 安装依赖
         run: flutter pub get
 
-      - name: 编译 Windows 桌面端 Release (强制指定 VS 2022 生成器)
-        env:
-          CMAKE_GENERATOR: "Visual Studio 17 2022"
+      - name: 编译 Windows X64 Release
         run: flutter build windows --release -t main.dart
 
-      - name: 打包为免安装便携版 ZIP (绿色单文件包)
+      - name: 内嵌 VC++ 运行库并打包为 X64 绿色便携版 ZIP
         run: |
-          Compress-Archive -Path build\windows\x64\runner\Release\* -DestinationPath weread-lite-windows-portable.zip -Force
+          $releaseDir = "build\windows\x64\runner\Release"
+          foreach ($dll in @("msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll")) {
+            $src = "C:\Windows\System32\$dll"
+            if (Test-Path $src) {
+              Copy-Item $src -Destination $releaseDir -Force
+            }
+          }
+          Compress-Archive -Path "$releaseDir\*" -DestinationPath weread-lite-windows-x64-portable.zip -Force
 
-      - name: 归档上传 Windows 便携版 ZIP
+      - name: 归档上传 Windows X64 便携版 ZIP
         uses: actions/upload-artifact@v4
         with:
-          name: weread-lite-windows-portable
-          path: weread-lite-windows-portable.zip
+          name: weread-lite-windows-x64-portable
+          path: weread-lite-windows-x64-portable.zip
           retention-days: 7
